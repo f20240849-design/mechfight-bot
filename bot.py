@@ -150,8 +150,9 @@ class Bot:
         # 4. High-Level Decision Engine (Disciplined Opportunist)
         zone = obs["zone"]
         zone_center = zone.get("next_center", zone.get("center", [0, 0]))
-        zone_radius = zone.get("next_radius", zone.get("radius", 500))
-        dist_to_zone_center = math.hypot(x - zone_center[0], y - zone_center[1])
+        next_radius = zone.get("next_radius", zone.get("radius", 380))
+        dist_to_next_center = math.hypot(x - zone_center[0], y - zone_center[1])
+        shrink_start = zone.get("shrink_start", 60.0)
 
         # Default movement & aim targets
         nav_target: Tuple[float, float] = (zone_center[0], zone_center[1])
@@ -159,23 +160,26 @@ class Bot:
         should_boost = False
         should_fire = [False, False]
 
+        # Only rotate for the zone when actually outside, or when shrink is imminent (< 15s) and we are far
+        is_outside = not me.get("in_zone", True)
+        shrink_imminent = t >= (shrink_start - 15.0) and dist_to_next_center > (next_radius - 25.0)
+        needs_zone_rotation = is_outside or shrink_imminent
+
         # --- Priority 1: Zone Safety ---
-        # Outside zone or in danger of collapse
-        if not me.get("in_zone", True) or dist_to_zone_center > zone_radius - 20:
+        if needs_zone_rotation:
             self.active_state = "ZONE_ROTATION"
             nav_target = (zone_center[0], zone_center[1])
-            should_boost = not me.get("in_zone", True)
+            should_boost = is_outside
 
         # --- Priority 2: Combat Reset / Cover Retreat ---
-        elif closest_enemy and (my_hp < 600 or (not in_combat_reset and my_hp < 900)):
+        elif closest_enemy and my_hp < 500:
             should_engage, _ = self.combat.evaluate_fight(my_hp, me["weapons"], me.get("cubes", 0), closest_enemy)
             if not should_engage:
                 self.active_state = "COMBAT_RESET"
-                # Find cover spot breaking LOS to enemy
                 cover = self.nav.find_cover_spot((x, y), (closest_enemy["pos"][0], closest_enemy["pos"][1]))
                 if cover:
                     nav_target = cover
-                should_boost = enemy_dist < 40.0
+                should_boost = enemy_dist < 30.0
 
         # --- Priority 3: Supply Drop Snatch / Ambush ---
         elif obs.get("drops") and t > 65.0:
@@ -187,23 +191,20 @@ class Bot:
 
             if d_lands_in <= 10.0 and d_dist < 100.0:
                 if d_holder is None and (not visible_enemies or enemy_dist > 60.0):
-                    # Uncontested! Rush and capture for instant full 1400 HP + 3 cubes!
                     self.active_state = "DROP_CAPTURE"
                     nav_target = (d_pos[0], d_pos[1])
                     should_boost = d_dist > 15.0
                 else:
-                    # Ambush from 50-70m away with cover
                     self.active_state = "DROP_AMBUSH"
                     ambush_pos = (d_pos[0] - 50.0, d_pos[1] - 20.0)
                     nav_target = ambush_pos
 
-        # --- Priority 4: Third-Party / Tactical Combat ---
+        # --- Priority 4: Tactical Combat (Always defend or press advantage) ---
         elif closest_enemy:
             should_engage, _ = self.combat.evaluate_fight(my_hp, me["weapons"], me.get("cubes", 0), closest_enemy)
-            if should_engage:
+            if should_engage or enemy_dist < 45.0:
                 self.active_state = "ENGAGE"
-                # Keep optimal 50m distance
-                if enemy_dist < 40.0:
+                if enemy_dist < 35.0:
                     kmove = self.combat.compute_kiting_move([x, y], closest_enemy["pos"], nav_target, tick)
                     nav_target = (x + kmove[0] * 20.0, y + kmove[1] * 20.0)
                 else:
@@ -211,11 +212,10 @@ class Bot:
             else:
                 self.active_state = "STALKING"
 
-        # --- Priority 5: Safe Farm / Opportunistic Third-Party ---
+        # --- Priority 5: Safe Farm (Shoot crates & harvest cubes) ---
         else:
             self.active_state = "SAFE_FARM"
             death_pos = self.radar.find_recent_death_event()
-            # If an enemy recently died within 120m, investigate to finish the wounded survivor
             if death_pos and math.hypot(death_pos[0] - x, death_pos[1] - y) < 120.0:
                 self.active_state = "THIRD_PARTY_AMBUSH"
                 nav_target = (death_pos[0], death_pos[1])
@@ -223,14 +223,23 @@ class Bot:
                 crates = obs.get("crates", [])
                 if crates:
                     crates.sort(key=lambda c: math.hypot(c["pos"][0] - x, c["pos"][1] - y))
-                    nav_target = (crates[0]["pos"][0], crates[0]["pos"][1])
+                    target_crate = crates[0]
+                    nav_target = (target_crate["pos"][0], target_crate["pos"][1])
+                    crate_dist = math.hypot(target_crate["pos"][0] - x, target_crate["pos"][1] - y)
+                    if crate_dist < 40.0 and self.nav.has_los(x, y, target_crate["pos"][0], target_crate["pos"][1]):
+                        cdx = target_crate["pos"][0] - x
+                        cdy = target_crate["pos"][1] - y
+                        cdz = (target_crate.get("pos", [0, 0, 0])[2] + 1.2) - (z + 7.0)
+                        torso_aim = (math.atan2(cdy, cdx), math.atan2(cdz, max(crate_dist, 0.01)))
+                        w0 = me["weapons"][0]
+                        if w0 and w0.get("ammo", 0) > 0 and w0.get("reload", 0) == 0:
+                            should_fire[0] = True
 
         # 5. Weapon Aiming & Firing Execution
         has_enemy_los = False
         if closest_enemy:
             has_enemy_los = self.nav.has_los(x, y, closest_enemy["pos"][0], closest_enemy["pos"][1])
             if has_enemy_los:
-                # Solve predictive lead aim
                 yaw, pitch, _ = self.ballistics.compute_lead_aim(
                     [x, y, z],
                     closest_enemy["pos"],
@@ -239,7 +248,6 @@ class Bot:
                 )
                 torso_aim = (yaw, pitch)
                 
-                # Check weapon firing triggers
                 should_fire = self.ballistics.decide_weapon_triggers(
                     me["weapons"],
                     closest_enemy,
@@ -247,12 +255,13 @@ class Bot:
                     has_enemy_los
                 )
 
-        # If retreating, aim toward enemy while moving away (rear armor protection)
+        # If in combat reset, aim at enemy to protect rear armor, and ONLY cease fire once LOS is broken!
         if self.active_state == "COMBAT_RESET" and closest_enemy:
             dx = closest_enemy["pos"][0] - x
             dy = closest_enemy["pos"][1] - y
             torso_aim = (math.atan2(dy, dx), 0.0)
-            # Stop firing so 45 HP/s out-of-combat heal activates!
+            if not has_enemy_los:
+                should_fire = [False, False]
             should_fire = [False, False]
 
         # 6. Motion Planning (Waypoints via A*)
