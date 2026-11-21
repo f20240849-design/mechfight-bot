@@ -522,19 +522,19 @@ class RooftopManager:
                 dx = p2[0] - p1[0]
                 dy = p2[1] - p1[1]
                 seg_len = math.hypot(dx, dy)
-                if seg_len < 2.0:
+                if seg_len < 1.5:
                     continue
 
                 # Outward normal for CCW polygon: (dy / len, -dx / len)
                 nx_out = dy / seg_len
                 ny_out = -dx / seg_len
 
-                sample_fractions = [0.5] if seg_len < 10.0 else [0.3, 0.7]
+                sample_fractions = [0.5] if seg_len < 8.0 else [0.25, 0.5, 0.75]
                 for frac in sample_fractions:
                     edge_x = p1[0] + frac * dx
                     edge_y = p1[1] + frac * dy
 
-                    for out_dist in (3.5, 5.0):
+                    for out_dist in (3.0, 4.5, 6.0, 7.5):
                         land_x = edge_x + nx_out * out_dist
                         land_y = edge_y + ny_out * out_dist
                         if self.is_ground_walkable(land_x, land_y):
@@ -548,6 +548,10 @@ class RooftopManager:
                                 )
                             )
                             break
+
+            # Discard trapped or completely enclosed roofs that lack safe drop-down exits
+            if not drop_points:
+                continue
 
             centroid_x = float(sum(xs) / len(xs))
             centroid_y = float(sum(ys) / len(ys))
