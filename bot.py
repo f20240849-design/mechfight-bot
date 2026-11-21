@@ -12,6 +12,7 @@ import mechfight as mf
 from nav import NavMesh
 from ballistics import Ballistics
 from combat import CombatSystem
+from acoustics import AcousticRadar
 
 class Bot:
     name = "opportunist-v1"
@@ -24,6 +25,7 @@ class Bot:
         self.nav = NavMesh(map_dir)
         self.ballistics = Ballistics(self.config)
         self.combat = CombatSystem(self.config)
+        self.radar = AcousticRadar()
 
         # Tactical memory
         self.seen_enemies: Dict[int, Dict[str, Any]] = {}
@@ -123,6 +125,7 @@ class Bot:
         t = obs["t"]
 
         self._update_memory(obs)
+        self.radar.update(obs.get("sounds", []), [x, y], t)
         action: mf.Action = {"tick": tick}
 
         # 1. Handle upgrade offer
@@ -208,13 +211,19 @@ class Bot:
             else:
                 self.active_state = "STALKING"
 
-        # --- Priority 5: Safe Farm (Crates / NPC Drones) ---
+        # --- Priority 5: Safe Farm / Opportunistic Third-Party ---
         else:
             self.active_state = "SAFE_FARM"
-            crates = obs.get("crates", [])
-            if crates:
-                crates.sort(key=lambda c: math.hypot(c["pos"][0] - x, c["pos"][1] - y))
-                nav_target = (crates[0]["pos"][0], crates[0]["pos"][1])
+            death_pos = self.radar.find_recent_death_event()
+            # If an enemy recently died within 120m, investigate to finish the wounded survivor
+            if death_pos and math.hypot(death_pos[0] - x, death_pos[1] - y) < 120.0:
+                self.active_state = "THIRD_PARTY_AMBUSH"
+                nav_target = (death_pos[0], death_pos[1])
+            else:
+                crates = obs.get("crates", [])
+                if crates:
+                    crates.sort(key=lambda c: math.hypot(c["pos"][0] - x, c["pos"][1] - y))
+                    nav_target = (crates[0]["pos"][0], crates[0]["pos"][1])
 
         # 5. Weapon Aiming & Firing Execution
         has_enemy_los = False
@@ -258,6 +267,15 @@ class Bot:
         else:
             move_yaw = math.atan2(nav_target[1] - y, nav_target[0] - x)
             move_vec = [math.cos(move_yaw), math.sin(move_yaw)]
+
+        # Steer away from active sound clusters during exploration
+        if self.active_state in ("SAFE_FARM", "ZONE_ROTATION") and not closest_enemy:
+            rep_x, rep_y = self.radar.get_danger_vector([x, y])
+            if (rep_x, rep_y) != (0.0, 0.0):
+                move_vec = [move_vec[0] * 0.75 + rep_x * 0.25, move_vec[1] * 0.75 + rep_y * 0.25]
+                mlen = math.hypot(move_vec[0], move_vec[1])
+                if mlen > 0.01:
+                    move_vec = [move_vec[0] / mlen, move_vec[1] / mlen]
 
         # If not actively aiming at enemy, look in direction of movement
         if not closest_enemy or not has_enemy_los:
