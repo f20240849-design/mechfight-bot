@@ -40,6 +40,7 @@ class Bot:
         self.last_damaged_time = -100.0
         self.last_attack_time = -100.0
         self.current_waypoints: List[Tuple[float, float]] = []
+        self.cached_nav_target: Optional[Tuple[float, float]] = None
         self.active_state = "SPAWN"
         self.gatekeep_aim_yaw = 0.0
         self.active_escape: Optional[RooftopEscapeTarget] = None
@@ -187,10 +188,12 @@ class Bot:
         should_boost = False
         should_fire = [False, False]
 
+        # 0. Check Zone Urgency & Gas Status
         is_outside = not me.get("in_zone", True)
         needs_zone_rotation, eta_seconds = self.gatekeeper.evaluate_rotation_urgency(
             (x, y), zone, my_speed=11.7, current_time=t
         )
+        shrink_imminent = (eta_seconds > max(1.0, shrink_start - t)) or (shrink_start - t < 15.0 and dist_to_next_center > next_radius - 20.0)
 
         # 0. Check Rooftop Verticality Status
         current_roof = self.rooftops.is_on_rooftop([x, y, z])
@@ -199,9 +202,11 @@ class Bot:
         # --- Priority 0: Active Rooftop Control & Safe Descent ---
         if current_roof:
             should_descend, descend_reason = self.rooftops.should_descend(
-                [x, y, z], zone, my_hp, me.get("max_hp", 1400.0), time_since_combat
+                [x, y, z], zone, my_hp, me.get("max_hp", 1400.0), time_since_combat,
+                is_outside=is_outside, shrink_imminent=shrink_imminent
             )
-            if should_descend:
+            # If outside zone or needs urgent rotation, FORCE immediate safe descent!
+            if should_descend or is_outside or needs_zone_rotation:
                 # Initiate safe zero-fall-damage descent into ground cover toward zone center
                 exit_info = self.rooftops.get_safe_exit_vector(
                     current_roof, (zone_center[0], zone_center[1]), closest_enemy["pos"] if closest_enemy else None
@@ -209,7 +214,7 @@ class Bot:
                 if exit_info:
                     self.active_state = "ROOFTOP_EXIT"
                     nav_target = (exit_info["ground_pos"][0], exit_info["ground_pos"][1])
-                    should_boost = is_outside
+                    should_boost = is_outside or eta_seconds > max(1.0, shrink_start - t)
             else:
                 # Hold safe 3m setback perch point: out-of-combat 45 HP/s active healing!
                 self.active_state = "ROOFTOP_PERCH"
@@ -409,13 +414,29 @@ class Bot:
             if not has_enemy_los and not (me["weapons"][1] and me["weapons"][1].get("kind") == "mortar"):
                 should_fire = [False, False]
 
-        # 6. Motion Planning (Waypoints via A*)
-        path = self.nav.plan_path((x, y), nav_target)
-        if path:
-            wp = path[0]
-            # Advance waypoint if close
-            if len(path) > 1 and math.hypot(wp[0] - x, wp[1] - y) < 4.0:
-                wp = path[1]
+        # 6. Motion Planning (Waypoints via A* with caching)
+        target_dist_from_cached = (
+            math.hypot(nav_target[0] - self.cached_nav_target[0], nav_target[1] - self.cached_nav_target[1])
+            if hasattr(self, "cached_nav_target") and self.cached_nav_target
+            else 999.0
+        )
+        # Advance current waypoints if we are close to the next one
+        while self.current_waypoints and math.hypot(self.current_waypoints[0][0] - x, self.current_waypoints[0][1] - y) < 4.0:
+            self.current_waypoints.pop(0)
+
+        # Re-plan if target changed significantly (>6m), waypoints empty, or lost line-of-sight to next waypoint
+        needs_replan = (
+            not self.current_waypoints
+            or target_dist_from_cached > 6.0
+            or not self.nav.has_los(x, y, self.current_waypoints[0][0], self.current_waypoints[0][1])
+        )
+
+        if needs_replan:
+            self.current_waypoints = self.nav.plan_path((x, y), nav_target)
+            self.cached_nav_target = nav_target
+
+        if self.current_waypoints:
+            wp = self.current_waypoints[0]
             move_yaw = math.atan2(wp[1] - y, wp[0] - x)
             move_vec = [math.cos(move_yaw), math.sin(move_yaw)]
         else:

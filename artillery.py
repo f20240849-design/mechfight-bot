@@ -287,8 +287,8 @@ class IndirectParabolicMortarSolver:
 
         yaw = math.atan2(dy, dx)
 
-        # 1. Point blank muzzle obstacle check: 4m along launch vector
-        if nav_mesh and hasattr(nav_mesh, "world_to_grid") and hasattr(nav_mesh, "grid"):
+        # 1. Point blank muzzle obstacle check: 4m along launch vector (only if ground-level, lz < 10.0)
+        if lz < 10.0 and nav_mesh and hasattr(nav_mesh, "world_to_grid") and hasattr(nav_mesh, "grid"):
             check_x = lx + min_wall_clearance * math.cos(yaw)
             check_y = ly + min_wall_clearance * math.sin(yaw)
             col, row = nav_mesh.world_to_grid(check_x, check_y)
@@ -459,7 +459,9 @@ class HitscanLaserController:
         horiz = math.hypot(dx, dy)
         yaw = math.atan2(dy, dx)
         pitch = math.atan2(dz, max(horiz, 0.01))
-        pitch = max(self.min_pitch, min(self.max_pitch, pitch))
+        # Prevent firing into roof lip when standing in 3m setback on elevated roof (z > 10m)
+        effective_min_pitch = -0.55 if my_pos[2] > 10.0 else self.min_pitch
+        pitch = max(effective_min_pitch, min(self.max_pitch, pitch))
         return yaw, pitch
 
     def update_cycle(
