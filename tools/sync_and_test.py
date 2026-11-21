@@ -85,12 +85,12 @@ def deploy_to_github():
     print("=" * 65)
 
     cmds = [
-        "git add bot.py nav.py ballistics.py combat.py acoustics.py artillery.py gatekeeper.py rooftops.py modules/",
+        "git add Dockerfile data/ bot.py nav.py ballistics.py combat.py acoustics.py artillery.py gatekeeper.py rooftops.py modules/",
         "git add python/",
-        "git commit -m 'Auto-integrate multi-agent modules (ATLAS, BALLIS, CHOKE)' || echo 'No new changes to commit'",
+        "git commit -m 'Fix scipy ModuleNotFoundError, rooftop gas trap, energy buffer, and mortar clearance' || echo 'No new changes to commit'",
         "git push origin main",
         "git checkout release",
-        "git merge main -m 'Sync multi-agent release'",
+        "git merge main -m 'Sync bugfixes and scipy dependency to release'",
         "git push origin release",
         "git checkout main"
     ]

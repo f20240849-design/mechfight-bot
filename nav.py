@@ -64,16 +64,32 @@ class NavMesh:
         return self.grid[row, col] == 0
 
     def has_los(self, x0: float, y0: float, x1: float, y1: float) -> bool:
-        """Check if straight line between (x0, y0) and (x1, y1) has no solid walls."""
+        """Check if straight line between (x0, y0) and (x1, y1) has no solid walls using zero-allocation integer Bresenham."""
         c0, r0 = self.world_to_grid(x0, y0)
         c1, r1 = self.world_to_grid(x1, y1)
-        dist_cells = int(max(abs(c1 - c0), abs(r1 - r0)))
-        if dist_cells <= 1:
-            return self.grid[r0, c0] != 1 and self.grid[r1, c1] != 1
-        cols = np.linspace(c0, c1, dist_cells + 1, dtype=int)
-        rows = np.linspace(r0, r1, dist_cells + 1, dtype=int)
-        # grid == 1 is solid wall; 0 and 2 allow vision/shots
-        return not np.any(self.grid[rows, cols] == 1)
+
+        dx = abs(c1 - c0)
+        dy = abs(r1 - r0)
+        sx = 1 if c0 < c1 else -1
+        sy = 1 if r0 < r1 else -1
+        err = dx - dy
+
+        grid = self.grid
+        c, r = c0, r0
+        while True:
+            # grid == 1 is solid wall; 0 and 2 allow vision/shots
+            if grid[r, c] == 1:
+                return False
+            if c == c1 and r == r1:
+                break
+            e2 = 2 * err
+            if e2 > -dy:
+                err -= dy
+                c += sx
+            if e2 < dx:
+                err += dx
+                r += sy
+        return True
 
     def find_nearest_walkable_2m(self, col_2m: int, row_2m: int, max_radius: int = 15) -> Tuple[int, int]:
         c = max(0, min(self.w_2m - 1, col_2m))

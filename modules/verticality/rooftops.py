@@ -48,9 +48,16 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
-import scipy.ndimage as ndi
-from scipy.spatial import cKDTree
-from PIL import Image, ImageDraw
+
+try:
+    import scipy.ndimage as ndi
+    from scipy.spatial import cKDTree
+    from PIL import Image, ImageDraw
+except ImportError:
+    ndi = None
+    cKDTree = None
+    Image = None
+    ImageDraw = None
 
 
 # =====================================================================
@@ -352,8 +359,56 @@ class RooftopManager:
     def _parse_rooftops(self, world: Dict[str, Any]):
         """
         Parses world.json prisms to identify flat, landable rooftops between 10m and 25m height.
-        Discards slanted or obstructed roofs and enforces the 3-meter setback rule.
+        Prefers precomputed data/rooftops.json cache to load in <15ms without scipy/PIL.
         """
+        here = os.path.dirname(os.path.abspath(__file__))
+        cache_paths = [
+            os.path.join(here, "data", "rooftops.json"),
+            os.path.join(self.map_dir, "data", "rooftops.json"),
+            os.path.join(self.map_dir, "rooftops.json"),
+            os.path.join(here, "rooftops.json"),
+            "data/rooftops.json"
+        ]
+        for cp in cache_paths:
+            if os.path.exists(cp):
+                try:
+                    with open(cp, "r") as f:
+                        cached_list = json.load(f)
+                    for d in cached_list:
+                        dp_list = [
+                            DropDownPoint(
+                                edge_pos=tuple(dp["edge_pos"]),
+                                exit_vec=tuple(dp["exit_vec"]),
+                                ground_pos=tuple(dp["ground_pos"]),
+                                ground_clearance=float(dp["ground_clearance"])
+                            )
+                            for dp in d.get("drop_points", [])
+                        ]
+                        roof = Rooftop(
+                            id=int(d["id"]),
+                            name=str(d["name"]),
+                            block_id=int(d["block_id"]),
+                            top=float(d["top"]),
+                            base=float(d["base"]),
+                            height=float(d["height"]),
+                            center=tuple(d["center"]),
+                            bounds=tuple(d["bounds"]),
+                            ring=[tuple(pt) for pt in d["ring"]],
+                            holes=[[tuple(pt) for pt in h] for h in d.get("holes", [])],
+                            area=float(d["area"]),
+                            usable_area=float(d["usable_area"]),
+                            max_setback=float(d["max_setback"]),
+                            best_perch=tuple(d["best_perch"]),
+                            perch_points=[tuple(pt) for pt in d.get("perch_points", [])],
+                            edges=[(tuple(e[0]), tuple(e[1])) for e in d.get("edges", [])],
+                            drop_points=dp_list
+                        )
+                        self.rooftops[roof.id] = roof
+                        self.rooftop_list.append(roof)
+                    return
+                except Exception:
+                    pass
+
         prisms = world.get("prisms", [])
         blocks = world.get("blocks", [])
 
@@ -522,19 +577,19 @@ class RooftopManager:
                 dx = p2[0] - p1[0]
                 dy = p2[1] - p1[1]
                 seg_len = math.hypot(dx, dy)
-                if seg_len < 2.0:
+                if seg_len < 1.5:
                     continue
 
                 # Outward normal for CCW polygon: (dy / len, -dx / len)
                 nx_out = dy / seg_len
                 ny_out = -dx / seg_len
 
-                sample_fractions = [0.5] if seg_len < 10.0 else [0.3, 0.7]
+                sample_fractions = [0.5] if seg_len < 8.0 else [0.25, 0.5, 0.75]
                 for frac in sample_fractions:
                     edge_x = p1[0] + frac * dx
                     edge_y = p1[1] + frac * dy
 
-                    for out_dist in (3.5, 5.0):
+                    for out_dist in (3.0, 4.5, 6.0, 7.5):
                         land_x = edge_x + nx_out * out_dist
                         land_y = edge_y + ny_out * out_dist
                         if self.is_ground_walkable(land_x, land_y):
@@ -548,6 +603,10 @@ class RooftopManager:
                                 )
                             )
                             break
+
+            # Discard trapped or completely enclosed roofs that lack safe drop-down exits
+            if not drop_points:
+                continue
 
             centroid_x = float(sum(xs) / len(xs))
             centroid_y = float(sum(ys) / len(ys))
@@ -578,10 +637,13 @@ class RooftopManager:
             self.rooftop_list.append(rooftop)
 
     def _build_spatial_index(self):
-        """Constructs cKDTree over rooftop centers for sub-millisecond proximity queries."""
+        """Constructs spatial index over rooftop centers for sub-millisecond proximity queries."""
         if self.rooftop_list:
             self.roof_centers = np.array([r.center for r in self.rooftop_list], dtype=np.float32)
-            self.kdtree = cKDTree(self.roof_centers)
+            if cKDTree is not None:
+                self.kdtree = cKDTree(self.roof_centers)
+            else:
+                self.kdtree = None
         else:
             self.roof_centers = np.empty((0, 2), dtype=np.float32)
             self.kdtree = None
@@ -637,10 +699,14 @@ class RooftopManager:
         mz = float(my_pos[2]) if len(my_pos) > 2 else self.get_ground_elevation(mx, my)
         ex, ey, ez = (float(enemy_pos[0]), float(enemy_pos[1]), float(enemy_pos[2])) if enemy_pos is not None else (None, None, None)
 
-        # High-performance spatial query: retrieve the 5 closest rooftops via cKDTree
+        # High-performance spatial query: retrieve the 5 closest rooftops
         k_search = min(5, len(self.rooftop_list))
-        _, candidate_indices = self.kdtree.query([mx, my], k=k_search)
-        query_indices = [candidate_indices] if np.isscalar(candidate_indices) else list(candidate_indices)
+        if self.kdtree is not None:
+            _, candidate_indices = self.kdtree.query([mx, my], k=k_search)
+            query_indices = [candidate_indices] if np.isscalar(candidate_indices) else list(candidate_indices)
+        else:
+            dists = np.hypot(self.roof_centers[:, 0] - mx, self.roof_centers[:, 1] - my)
+            query_indices = list(np.argsort(dists)[:k_search])
 
         best_roof: Optional[Rooftop] = None
         best_approach_2d: Optional[Tuple[float, float]] = None
@@ -661,7 +727,8 @@ class RooftopManager:
                     continue
 
                 energy_cost = self.calculate_climb_energy(h_diff)
-                if energy < energy_cost:
+                # Enforce +30.0 energy reserve buffer (prevents mid-air jump plunge)
+                if energy < (energy_cost + 30.0):
                     continue
 
                 v_eb_x = roof.center[0] - ex if ex is not None else 0.0
@@ -713,8 +780,13 @@ class RooftopManager:
 
         # Fallback to broader search if closest 5 were energy-starved
         if best_roof is None and len(self.rooftop_list) > k_search:
-            _, broader_indices = self.kdtree.query([mx, my], k=min(12, len(self.rooftop_list)))
-            evaluate_indices(list(broader_indices)[k_search:])
+            if self.kdtree is not None:
+                _, broader_indices = self.kdtree.query([mx, my], k=min(12, len(self.rooftop_list)))
+                broader_list = list(broader_indices)[k_search:]
+            else:
+                dists = np.hypot(self.roof_centers[:, 0] - mx, self.roof_centers[:, 1] - my)
+                broader_list = list(np.argsort(dists)[k_search:min(12, len(self.rooftop_list))])
+            evaluate_indices(broader_list)
 
         if best_roof is None or best_approach_2d is None or best_climb_edge is None:
             t_elapsed = (time.perf_counter() - t0) * 1000.0
@@ -1049,15 +1121,12 @@ class RooftopManager:
         current_hp: float = 1400.0,
         max_hp: float = 1400.0,
         time_since_combat: float = 10.0,
-        mortar_threat: bool = False
+        mortar_threat: bool = False,
+        is_outside: bool = False,
+        shrink_imminent: bool = False
     ) -> Tuple[bool, str]:
         """
         Evaluates whether a parked bot on a rooftop should initiate a safe descent.
-        
-        Conditions for descent:
-        1. Zone closing: Safe zone is shrinking and roof will be outside border.
-        2. Combat reset achieved: HP restored to >= 90% and out-of-combat heal completed.
-        3. Mortar threat: Mortar shells targeting open rooftop.
         """
         current_roof = self.is_on_rooftop(my_pos)
         if current_roof is None:
@@ -1065,6 +1134,9 @@ class RooftopManager:
 
         if mortar_threat:
             return True, "MORTAR_EVACUATION"
+
+        if is_outside or shrink_imminent:
+            return True, "ZONE_CLOSING_DESCENT"
 
         next_center = zone_info.get("next_center", zone_info.get("center", [0.0, 0.0]))
         next_radius = zone_info.get("next_radius", zone_info.get("radius", 380.0))
