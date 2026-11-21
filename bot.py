@@ -16,6 +16,7 @@ from ballistics import Ballistics
 from combat import CombatSystem
 from acoustics import AcousticRadar
 from artillery import ArtillerySystem
+from gatekeeper import ZoneGatekeeper, Chokepoint
 
 class Bot:
     name = "opportunist-v1"
@@ -30,6 +31,7 @@ class Bot:
         self.combat = CombatSystem(self.config)
         self.radar = AcousticRadar()
         self.artillery = ArtillerySystem(self.config)
+        self.gatekeeper = ZoneGatekeeper(map_dir)
 
         # Tactical memory
         self.seen_enemies: Dict[int, Dict[str, Any]] = {}
@@ -37,6 +39,7 @@ class Bot:
         self.last_attack_time = -100.0
         self.current_waypoints: List[Tuple[float, float]] = []
         self.active_state = "SPAWN"
+        self.gatekeep_aim_yaw = 0.0
 
         # Complete upgrade priority ranking (all 22 upgrades from config)
         self.upgrade_ranks = {
@@ -167,12 +170,13 @@ class Bot:
         closest_enemy = visible_enemies[0] if visible_enemies else None
         enemy_dist = math.hypot(closest_enemy["pos"][0] - x, closest_enemy["pos"][1] - y) if closest_enemy else 1e9
 
-        # 4. High-Level Decision Engine (Disciplined Opportunist)
+        # 4. High-Level Decision Engine (Disciplined Opportunist & Zone Gatekeeper)
         zone = obs["zone"]
         zone_center = zone.get("next_center", zone.get("center", [0, 0]))
         next_radius = zone.get("next_radius", zone.get("radius", 380))
         dist_to_next_center = math.hypot(x - zone_center[0], y - zone_center[1])
         shrink_start = zone.get("shrink_start", 60.0)
+        alive_count = obs.get("alive", 16)
 
         # Default movement & aim targets
         nav_target: Tuple[float, float] = (zone_center[0], zone_center[1])
@@ -180,16 +184,56 @@ class Bot:
         should_boost = False
         should_fire = [False, False]
 
-        # Only rotate for the zone when actually outside, or when shrink is imminent (< 15s) and we are far
         is_outside = not me.get("in_zone", True)
-        shrink_imminent = t >= (shrink_start - 15.0) and dist_to_next_center > (next_radius - 25.0)
-        needs_zone_rotation = is_outside or shrink_imminent
+        needs_zone_rotation, eta_seconds = self.gatekeeper.evaluate_rotation_urgency(
+            (x, y), zone, my_speed=11.7, current_time=t
+        )
 
-        # --- Priority 1: Zone Safety ---
-        if needs_zone_rotation:
-            self.active_state = "ZONE_ROTATION"
-            nav_target = (zone_center[0], zone_center[1])
-            should_boost = is_outside
+        # --- Priority 1: Endgame Survival Engine (< 5 alive) ---
+        if self.gatekeeper.is_endgame(alive_count, next_radius):
+            self.active_state = "ENDGAME_SURVIVAL"
+            endgame_pos = self.gatekeeper.get_endgame_position((x, y), zone, alive_count)
+            nav_target = endgame_pos
+
+            # If enemy visible, check whether to avoid optional fight
+            if closest_enemy:
+                avoid_fight = self.gatekeeper.should_avoid_combat(alive_count, my_hp, closest_enemy, enemy_dist)
+                if avoid_fight:
+                    # Break LOS and stay in deep cover; do not shoot unless directly attacked
+                    cover = self.nav.find_cover_spot((x, y), (closest_enemy["pos"][0], closest_enemy["pos"][1]))
+                    if cover:
+                        nav_target = cover
+                    should_boost = enemy_dist < 30.0
+
+        # --- Priority 2: Zone Safety & Gatekeeper Ambush Doctrine ---
+        elif needs_zone_rotation:
+            chokes = self.gatekeeper.find_chokepoints(
+                zone.get("radius", 560.0),
+                (zone_center[0], zone_center[1]),
+                next_radius
+            )
+            gatekeep_target = self.gatekeeper.select_gatekeep_position((x, y), chokes)
+
+            # Check for Ohio Stadium pinch
+            is_pinched, bypass_wp = self.gatekeeper.is_stadium_pinch((x, y), gatekeep_target)
+            if is_pinched and bypass_wp:
+                nav_target = bypass_wp
+            else:
+                nav_target = gatekeep_target
+
+            dist_to_gatekeep = math.hypot(gatekeep_target[0] - x, gatekeep_target[1] - y)
+            is_in_safe_zone = dist_to_next_center < (next_radius - 12.0)
+
+            # If arrived early at the gatekeep ambush spot inside the safe zone:
+            if dist_to_gatekeep < 6.0 and is_in_safe_zone and not is_outside:
+                self.active_state = "GATEKEEP_AMBUSH"
+                if chokes:
+                    holding_yaw, holding_pitch = self.gatekeeper.get_ambush_aim((x, y), chokes[0])
+                    self.gatekeep_aim_yaw = holding_yaw
+                    torso_aim = (holding_yaw, holding_pitch)
+            else:
+                self.active_state = "ZONE_ROTATION"
+                should_boost = is_outside or eta_seconds > max(1.0, shrink_start - t)
 
         # --- Priority 2: Cover Retreat / Combat Reset ---
         # Retreat to cover if:
@@ -339,8 +383,10 @@ class Bot:
                 if mlen > 0.01:
                     move_vec = [move_vec[0] / mlen, move_vec[1] / mlen]
 
-        # If not actively aiming at enemy or indirect artillery, look in direction of movement
-        if (not closest_enemy or not has_enemy_los) and not (should_fire[0] or should_fire[1]):
+        # If in GATEKEEP_AMBUSH, hold aim down the alley; otherwise look in direction of movement
+        if self.active_state == "GATEKEEP_AMBUSH" and (not closest_enemy or not has_enemy_los):
+            torso_aim = (self.gatekeep_aim_yaw, 0.0)
+        elif (not closest_enemy or not has_enemy_los) and not (should_fire[0] or should_fire[1]):
             torso_aim = (move_yaw, 0.0)
 
         action.update(
