@@ -130,7 +130,6 @@ class ZoneGatekeeper:
         bin_path = self._resolve_path("occupancy.bin")
 
         if not meta_path or not bin_path:
-            # Fallback synthetic grid for testing environments if files not found
             meta = {"nx": 1070, "ny": 724, "minX": -513.0, "minY": -334.0, "step": 1.0}
             grid = np.zeros((724, 1070), dtype=np.uint8)
             return meta, grid
@@ -351,7 +350,7 @@ class ZoneGatekeeper:
             seen_starts.add(start)
 
             width_m = length * arc_meter_factor
-            # A chokepoint funnel is narrow: width between 3.5m and 35.0m
+            # A chokepoint funnel is narrow: width between 3.5m and 38.0m
             if not (3.5 <= width_m <= 38.0):
                 continue
 
@@ -473,11 +472,8 @@ class ZoneGatekeeper:
 
         chokepoints = chokepoints_or_choke
         if not chokepoints:
-            # Fallback to current position
             return my_pos
 
-        # Rank candidate chokepoints:
-        # Balance between traffic funnel quality and travel distance from my_pos
         best_cp = chokepoints[0]
         best_score = -1e9
         for cp in chokepoints:
@@ -529,7 +525,6 @@ class ZoneGatekeeper:
         if not self.is_endgame(alive_count, 100.0):
             return False
 
-        # If no enemy, trivially avoid combat
         if not enemy:
             return True
 
@@ -537,7 +532,7 @@ class ZoneGatekeeper:
         if enemy_dist < 25.0:
             return False
 
-        # If enemy is not attacking us, or dist > 25m: avoid fight!
+        # If enemy is not attacking us, or dist >= 25m: avoid fight!
         return True
 
     def get_endgame_position(
@@ -595,7 +590,6 @@ class ZoneGatekeeper:
             z_norm = np.zeros_like(dists)
 
         # 2. Deep Cover component:
-        # Distance preference: stay 20m - 35m from center
         dist_pref = -np.abs(dists - (r * 0.5)) / max(1.0, r)
 
         # Composite survival score: high ground (4.0) + distance buffer (2.0)
@@ -646,8 +640,6 @@ def run_all_tests():
     # Test 2: Gatekeeper Early Rotation Urgency vs Naive 15s Late Rotation
     # -------------------------------------------------------------------------
     print("\n[Test 2] Gatekeeper Early Rotation Urgency Doctrine")
-    # Naive bots start rotating at shrink_start - 15.0s.
-    # Our bot must rotate ahead of the warning to claim cover.
     zone_test = {
         "center": [41.3, -72.8],
         "radius": 560.0,
@@ -655,18 +647,15 @@ def run_all_tests():
         "next_radius": 380.0,
         "shrink_start": 60.0,
         "shrink_end": 110.0,
-        "t": 30.0  # 30s before shrink
+        "t": 30.0
     }
-    # Bot placed at 480m (100m outside the safe circle 380m)
     bot_pos = (41.3 + 480.0, -72.8)
     needs_rot, eta = gk.evaluate_rotation_urgency(bot_pos, zone_test, my_speed=11.7, current_time=30.0)
     print(f"  Bot at distance 480m (100m outside safe circle):")
     print(f"    Calculated traversal ETA: {eta:.1f}s")
     print(f"    Rotation urgent at t=30.0s (30s before shrink)? {needs_rot}")
-    # At t=30s, ETA ~ 12.8s + 15s warning + 12s early margin = 39.8s > 30s remaining -> must rotate!
     assert needs_rot is True, "Gatekeeper should trigger early rotation ahead of naive bots!"
 
-    # Bot already safely inside next circle (distance 200m)
     safe_bot = (41.3 + 200.0, -72.8)
     needs_rot_safe, _ = gk.evaluate_rotation_urgency(safe_bot, zone_test, my_speed=11.7, current_time=30.0)
     assert needs_rot_safe is False, "Bot safely inside next circle should not panic rotate"
@@ -676,11 +665,10 @@ def run_all_tests():
     # Test 3: Ohio Stadium Pinch Avoidance
     # -------------------------------------------------------------------------
     print("\n[Test 3] Ohio Stadium Pinch Avoidance & Safe Bypass")
-    west_bot = (-360.0, 100.0)    # West of Ohio Stadium
-    south_goal = (41.3, -72.8)    # South-east safe zone
-    north_goal = (41.3, 200.0)    # North-east safe zone
+    west_bot = (-360.0, 100.0)
+    south_goal = (41.3, -72.8)
+    north_goal = (41.3, 200.0)
 
-    # Test South Goal -> selects South bypass
     is_pinched_s, bypass_s = gk.is_stadium_pinch(west_bot, south_goal)
     print(f"  West bot at {west_bot} heading to South goal {south_goal}:")
     print(f"    Detected Stadium Pinch? {is_pinched_s}")
@@ -688,7 +676,6 @@ def run_all_tests():
     assert is_pinched_s is True, "Should detect stadium obstacle pinch!"
     assert bypass_s == gk.stadium_south_bypass, "Should select South bypass for southern destination!"
 
-    # Test North Goal -> selects North bypass
     is_pinched_n, bypass_n = gk.is_stadium_pinch(west_bot, north_goal)
     print(f"  West bot at {west_bot} heading to North goal {north_goal}:")
     print(f"    Detected Stadium Pinch? {is_pinched_n}")
@@ -696,7 +683,6 @@ def run_all_tests():
     assert is_pinched_n is True, "Should detect stadium obstacle pinch!"
     assert bypass_n == gk.stadium_north_bypass, "Should select North bypass for northern destination!"
 
-    # Urgency check with stadium pinch accounts for detour
     needs_rot_stadium, eta_stadium = gk.evaluate_rotation_urgency(west_bot, zone_test, my_speed=11.7, current_time=20.0)
     print(f"    Stadium bypass traversal ETA: {eta_stadium:.1f}s, urgent: {needs_rot_stadium}")
     assert eta_stadium > 15.0, "Detour around stadium should reflect realistic travel ETA"
@@ -714,15 +700,12 @@ def run_all_tests():
     print(f"  Holding ambush at: ({ambush_pos[0]:.1f}, {ambush_pos[1]:.1f})")
     print(f"  Holding pre-aim down alley: {math.degrees(aim_yaw):.1f}°")
 
-    # Verify ambush position is walkable and inside safe circle
     assert gk.is_walkable(ambush_pos[0], ambush_pos[1]), "Ambush spot must be walkable"
     dist_ambush_center = math.hypot(ambush_pos[0] - center[0], ambush_pos[1] - center[1])
     assert dist_ambush_center <= 240.0, "Ambush spot must be inside the safe zone!"
 
-    # Simulate panic rotator arriving down the alley
     scrambler_pos = chosen_choke.pos
-    scrambler_hp = 420.0  # Damaged by zone gas
-    # Check aim delta: our bot is already pre-aimed down the alley!
+    scrambler_hp = 420.0
     scrambler_yaw = math.atan2(scrambler_pos[1] - ambush_pos[1], scrambler_pos[0] - ambush_pos[0])
     angle_error = abs(math.atan2(math.sin(aim_yaw - scrambler_yaw), math.cos(aim_yaw - scrambler_yaw)))
     print(f"  Incoming panic scrambler at alley entrance ({scrambler_pos[0]:.1f}, {scrambler_pos[1]:.1f}) [HP: {scrambler_hp}]")
@@ -736,7 +719,6 @@ def run_all_tests():
     assert gk.is_endgame(alive_count=4, zone_radius=50.0) is True, "alive=4 must be endgame"
     assert gk.is_endgame(alive_count=12, zone_radius=300.0) is False, "alive=12 is not endgame"
 
-    # Avoid optional fights check
     enemy_far = {"id": 2, "hp": 1200.0, "weapons": ["gun"]}
     avoid_far = gk.should_avoid_combat(alive_count=3, my_hp=1400.0, enemy=enemy_far, enemy_dist=80.0)
     print(f"  alive=3: Enemy at 80m -> avoid fight? {avoid_far}")
@@ -747,7 +729,6 @@ def run_all_tests():
     print(f"  alive=3: Point-blank threat at 15m -> avoid fight? {avoid_close}")
     assert avoid_close is False, "Must engage in point-blank self-defense!"
 
-    # High ground & deep cover in final 60m circle
     final_zone = {"center": [41.3, -72.8], "radius": 60.0, "next_radius": 60.0}
     endgame_pos = gk.get_endgame_position((41.3, -72.8), final_zone, alive_count=3)
     endgame_dist = math.hypot(endgame_pos[0] - center[0], endgame_pos[1] - center[1])

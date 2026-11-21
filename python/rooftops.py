@@ -8,9 +8,9 @@ Key Systems:
    - Identifies flat, landable rooftops between 10m and 25m height.
    - Detects and discards slanted ramp structures, narrow ledges (<6m),
      and roofs obstructed by taller upper-tier prisms or overhangs.
-   - Uses Euclidean Distance Transform (EDT) at 0.5m resolution to compute
-     exact setback fields from all outer perimeter walls, inner courtyards/holes,
-     and obstructing structures.
+   - Uses Euclidean Distance Transform (EDT) at 0.5m resolution with continuous
+     validation to compute exact setback fields from all outer perimeter walls,
+     inner courtyards/holes, and obstructing structures.
 
 2. Jump-Jet Escape Controller:
    - Function `find_nearest_rooftop_escape(my_pos, enemy_pos, energy)`:
@@ -35,7 +35,7 @@ Key Systems:
 
 5. High-Performance Execution:
    - Spatial indexing via cKDTree and precomputed geometric caches.
-   - All runtime queries execute in < 0.1 ms (far below the 1.5 ms budget).
+   - All runtime queries execute in < 0.2 ms (far below the 1.5 ms budget).
 """
 
 from __future__ import annotations
@@ -406,7 +406,32 @@ class RooftopManager:
                     if not (max(oxs) < min_px or min(oxs) > max_px or max(oys) < min_py or min(oys) > max_py):
                         obstructing_prisms.append(other_p)
 
-            # 5. Rasterize roof and compute Euclidean Distance Transform for 3m setback
+            # 5. Extract edge line segments for outer perimeter and courtyards
+            polygon_pts = [(xs[i], ys[i]) for i in range(len(xs))]
+            holes = p.get("holes", [])
+            holes_pts = []
+            for h in holes:
+                if len(h) >= 6:
+                    holes_pts.append([(h[i], h[i+1]) for i in range(0, len(h), 2)])
+
+            edges: List[Tuple[Tuple[float, float], Tuple[float, float]]] = []
+            n_pts = len(polygon_pts)
+            for i in range(n_pts):
+                edges.append((polygon_pts[i], polygon_pts[(i + 1) % n_pts]))
+            for hpts in holes_pts:
+                hn = len(hpts)
+                for i in range(hn):
+                    edges.append((hpts[i], hpts[(i + 1) % hn]))
+            # Also include edges of upper obstructing prisms as roof boundaries
+            for op in obstructing_prisms:
+                op_xs = op.get("ring", [])[0::2]
+                op_ys = op.get("ring", [])[1::2]
+                op_pts = [(op_xs[i], op_ys[i]) for i in range(len(op_xs))]
+                op_n = len(op_pts)
+                for i in range(op_n):
+                    edges.append((op_pts[i], op_pts[(i + 1) % op_n]))
+
+            # 6. Rasterize roof and compute Euclidean Distance Transform for initial candidate search
             res = 0.5  # 0.5 meter precision
             margin = 2.0
             gx0 = min_px - margin
@@ -424,7 +449,6 @@ class RooftopManager:
             draw.polygon(poly, fill=255)
 
             # Subtract courtyard holes
-            holes = p.get("holes", [])
             for h in holes:
                 if len(h) >= 6:
                     hpoly = [((h[i] - gx0) / res, (h[i+1] - gy0) / res) for i in range(0, len(h), 2)]
@@ -443,53 +467,54 @@ class RooftopManager:
 
             # Distance transform: distance in meters to nearest edge/hole/obstruction
             dist_map = ndi.distance_transform_edt(roof_mask) * res
-            max_setback = float(np.max(dist_map))
+            max_setback_approx = float(np.max(dist_map))
 
-            # 6. Enforce 3-Meter Roof-Edge Setback Rule:
-            # Roof is disqualified if no interior point can achieve >= 3.0m setback!
-            if max_setback < ROOF_MIN_SETBACK:
+            # Disqualify if raster setback is under 3.0m
+            if max_setback_approx < ROOF_MIN_SETBACK:
                 continue
 
-            # Identify deepest interior perch point
+            # Identify candidate deepest interior perch point
             max_pos_idx = np.unravel_index(np.argmax(dist_map), dist_map.shape)
             best_perch_x = float(gx0 + max_pos_idx[1] * res)
             best_perch_y = float(gy0 + max_pos_idx[0] * res)
 
-            # Collect candidate interior perch points (subsampled every 2m for speed)
-            perch_mask = dist_map >= ROOF_MIN_SETBACK
+            # 7. Strictly enforce the 3-Meter Roof-Edge Setback Rule:
+            # Filter all candidate points using continuous Euclidean distance to segments >= 3.0m!
+            perch_mask = dist_map >= 3.1
             usable_area = float(np.sum(perch_mask)) * (res * res)
             total_area = float(np.sum(roof_mask)) * (res * res)
 
-            # Subsample perch points for tactical selection
             step_stride = max(1, int(round(2.0 / res)))
             sub_perch_mask = np.zeros_like(perch_mask)
             sub_perch_mask[::step_stride, ::step_stride] = perch_mask[::step_stride, ::step_stride]
             py_indices, px_indices = np.where(sub_perch_mask)
 
             perch_points: List[Tuple[float, float, float]] = []
+            true_max_setback = 0.0
+
             for pr, pc in zip(py_indices, px_indices):
-                perch_points.append((float(gx0 + pc * res), float(gy0 + pr * res), top))
+                cand_x = float(gx0 + pc * res)
+                cand_y = float(gy0 + pr * res)
+                # Compute continuous Euclidean distance to all boundary edges
+                min_edge_d = min(point_segment_distance(cand_x, cand_y, e[0][0], e[0][1], e[1][0], e[1][1])[0] for e in edges)
+                if min_edge_d >= ROOF_MIN_SETBACK:
+                    perch_points.append((cand_x, cand_y, top))
+                    if min_edge_d > true_max_setback:
+                        true_max_setback = min_edge_d
+                        best_perch_x = cand_x
+                        best_perch_y = cand_y
 
+            # If no point passed the continuous 3m check, this roof is rejected
             if not perch_points:
-                perch_points.append((best_perch_x, best_perch_y, top))
+                # Test best_perch specifically
+                min_edge_d = min(point_segment_distance(best_perch_x, best_perch_y, e[0][0], e[0][1], e[1][0], e[1][1])[0] for e in edges)
+                if min_edge_d >= ROOF_MIN_SETBACK:
+                    perch_points.append((best_perch_x, best_perch_y, top))
+                    true_max_setback = min_edge_d
+                else:
+                    continue
 
-            # 7. Extract edge line segments
-            polygon_pts = [(xs[i], ys[i]) for i in range(len(xs))]
-            holes_pts = []
-            for h in holes:
-                if len(h) >= 6:
-                    holes_pts.append([(h[i], h[i+1]) for i in range(0, len(h), 2)])
-
-            edges: List[Tuple[Tuple[float, float], Tuple[float, float]]] = []
-            n_pts = len(polygon_pts)
-            for i in range(n_pts):
-                edges.append((polygon_pts[i], polygon_pts[(i + 1) % n_pts]))
-            for hpts in holes_pts:
-                hn = len(hpts)
-                for i in range(hn):
-                    edges.append((hpts[i], hpts[(i + 1) % hn]))
-
-            # 8. Compute safe drop-down & exit points along perimeter
+            # 8. Compute safe drop-down & exit points along outer perimeter
             drop_points: List[DropDownPoint] = []
             for i in range(n_pts):
                 p1 = polygon_pts[i]
@@ -504,13 +529,11 @@ class RooftopManager:
                 nx_out = dy / seg_len
                 ny_out = -dx / seg_len
 
-                # Sample midpoint and third points along long edges
                 sample_fractions = [0.5] if seg_len < 10.0 else [0.3, 0.7]
                 for frac in sample_fractions:
                     edge_x = p1[0] + frac * dx
                     edge_y = p1[1] + frac * dy
 
-                    # Test landing spot 3.5m out from wall
                     for out_dist in (3.5, 5.0):
                         land_x = edge_x + nx_out * out_dist
                         land_y = edge_y + ny_out * out_dist
@@ -544,7 +567,7 @@ class RooftopManager:
                 holes=holes_pts,
                 area=total_area,
                 usable_area=usable_area,
-                max_setback=max_setback,
+                max_setback=true_max_setback,
                 best_perch=(best_perch_x, best_perch_y, top),
                 perch_points=perch_points,
                 edges=edges,
@@ -604,7 +627,7 @@ class RooftopManager:
         Returns:
             RooftopEscapeTarget with ground approach waypoint, climb edge, safe interior perch,
             and energy cost, or None if no climbable roof is in range.
-        Execution budget: < 0.15 ms.
+        Execution budget: < 0.20 ms.
         """
         t0 = time.perf_counter()
         if not self.rooftop_list or self.kdtree is None:
@@ -612,102 +635,112 @@ class RooftopManager:
 
         mx, my = float(my_pos[0]), float(my_pos[1])
         mz = float(my_pos[2]) if len(my_pos) > 2 else self.get_ground_elevation(mx, my)
-
-        # 1. Spatial query: Find nearby rooftops within max_search_radius
-        query_indices = self.kdtree.query_ball_point([mx, my], r=max_search_radius)
-        if not query_indices:
-            # Fallback to closest 3 rooftops regardless of radius
-            _, closest_idx = self.kdtree.query([mx, my], k=min(3, len(self.rooftop_list)))
-            query_indices = [closest_idx] if np.isscalar(closest_idx) else list(closest_idx)
-
-        best_target: Optional[RooftopEscapeTarget] = None
-        best_score = float("inf")
-
         ex, ey, ez = (float(enemy_pos[0]), float(enemy_pos[1]), float(enemy_pos[2])) if enemy_pos is not None else (None, None, None)
 
-        for idx in query_indices:
-            roof = self.rooftop_list[idx]
-            h_diff = roof.top - mz
+        # High-performance spatial query: retrieve the 5 closest rooftops via cKDTree
+        k_search = min(5, len(self.rooftop_list))
+        _, candidate_indices = self.kdtree.query([mx, my], k=k_search)
+        query_indices = [candidate_indices] if np.isscalar(candidate_indices) else list(candidate_indices)
 
-            # Must be taller than current elevation and within height caps
-            if h_diff < 1.0 or h_diff > 30.0:
-                continue
+        best_roof: Optional[Rooftop] = None
+        best_approach_2d: Optional[Tuple[float, float]] = None
+        best_climb_edge: Optional[Tuple[float, float, float]] = None
+        best_energy_cost: float = 0.0
+        best_dist_approach: float = 0.0
+        best_shielded: bool = False
+        best_score = float("inf")
 
-            energy_cost = self.calculate_climb_energy(h_diff)
-            # Adversarial mitigation: never attempt a climb if energy is insufficient
-            if energy < energy_cost:
-                continue
+        def evaluate_indices(indices):
+            nonlocal best_roof, best_approach_2d, best_climb_edge, best_energy_cost
+            nonlocal best_dist_approach, best_shielded, best_score
+            for idx in indices:
+                roof = self.rooftop_list[idx]
+                h_diff = roof.top - mz
 
-            # Evaluate each outer edge segment of this rooftop to find the optimal approach
-            for p1, p2 in roof.edges[:len(roof.ring)]:
-                dist_to_seg, qx, qy = point_segment_distance(mx, my, p1[0], p1[1], p2[0], p2[1])
-
-                # Outward normal for this segment
-                sdx = p2[0] - p1[0]
-                sdy = p2[1] - p1[1]
-                slen = math.hypot(sdx, sdy)
-                if slen < 1e-4:
+                if h_diff < 1.0 or h_diff > 30.0:
                     continue
-                nx_out = sdy / slen
-                ny_out = -sdx / slen
 
-                # Ground approach waypoint at wall base (2.5m out from wall for clearance)
-                approach_x = qx + nx_out * 2.5
-                approach_y = qy + ny_out * 2.5
-                approach_z = self.get_ground_elevation(approach_x, approach_y)
-                dist_approach = math.hypot(approach_x - mx, approach_y - my)
+                energy_cost = self.calculate_climb_energy(h_diff)
+                if energy < energy_cost:
+                    continue
 
-                # Edge climb contact point on roof
-                climb_edge_point = (qx, qy, roof.top)
+                v_eb_x = roof.center[0] - ex if ex is not None else 0.0
+                v_eb_y = roof.center[1] - ey if ey is not None else 0.0
 
-                # Tactical enemy exposure & building shielding evaluation
-                shielded = False
-                exposure_penalty = 0.0
+                # Evaluate outer boundary segments of this rooftop
+                for p1, p2 in roof.edges[:len(roof.ring)]:
+                    dist_to_seg, qx, qy = point_segment_distance(mx, my, p1[0], p1[1], p2[0], p2[1])
 
-                if ex is not None and ey is not None:
-                    # Vector from enemy to building center
-                    v_eb_x = roof.center[0] - ex
-                    v_eb_y = roof.center[1] - ey
-                    # Vector from building center to this approach edge
-                    v_ba_x = approach_x - roof.center[0]
-                    v_ba_y = approach_y - roof.center[1]
+                    sdx = p2[0] - p1[0]
+                    sdy = p2[1] - p1[1]
+                    slen = math.hypot(sdx, sdy)
+                    if slen < 1e-4:
+                        continue
+                    nx_out = sdy / slen
+                    ny_out = -sdx / slen
 
-                    dot_prod = v_eb_x * v_ba_x + v_eb_y * v_ba_y
-                    # Positive dot product means approach is on the FAR side (shielded by building!)
-                    if dot_prod > 0.0:
-                        shielded = True
-                    else:
-                        # Near side facing the enemy
-                        dist_enemy_to_approach = math.hypot(approach_x - ex, approach_y - ey)
-                        if dist_enemy_to_approach < 35.0:
-                            exposure_penalty = 30.0 * (1.0 - dist_enemy_to_approach / 35.0)
+                    approach_x = qx + nx_out * 2.5
+                    approach_y = qy + ny_out * 2.5
+                    dist_approach = math.hypot(approach_x - mx, approach_y - my)
 
-                # Scoring: prioritize close approach, safe shielding, low energy cost
-                # Shielding grants a -20.0 distance bonus
-                shield_bonus = 20.0 if shielded else 0.0
-                score = dist_approach + 0.4 * energy_cost + exposure_penalty - shield_bonus
+                    shielded = False
+                    exposure_penalty = 0.0
 
-                if score < best_score:
-                    # Select safe perch point away from enemy
-                    perch = self.get_safe_perch_point(roof, enemy_pos)
-                    # Safe exit drop-down point
-                    safe_exit = roof.drop_points[0] if roof.drop_points else None
+                    if ex is not None and ey is not None:
+                        v_ba_x = approach_x - roof.center[0]
+                        v_ba_y = approach_y - roof.center[1]
+                        dot_prod = v_eb_x * v_ba_x + v_eb_y * v_ba_y
+                        if dot_prod > 0.0:
+                            shielded = True
+                        else:
+                            dist_enemy_to_approach = math.hypot(approach_x - ex, approach_y - ey)
+                            if dist_enemy_to_approach < 35.0:
+                                exposure_penalty = 30.0 * (1.0 - dist_enemy_to_approach / 35.0)
 
-                    best_score = score
-                    best_target = RooftopEscapeTarget(
-                        roof_id=roof.id,
-                        roof_name=roof.name,
-                        roof_top=roof.top,
-                        roof_height=roof.height,
-                        energy_cost=energy_cost,
-                        ground_approach=(approach_x, approach_y, approach_z),
-                        climb_edge=climb_edge_point,
-                        perch_point=perch,
-                        dist_to_approach=dist_approach,
-                        safe_exit=safe_exit,
-                        shielded_from_enemy=shielded,
-                        score=score
-                    )
+                    shield_bonus = 20.0 if shielded else 0.0
+                    score = dist_approach + 0.4 * energy_cost + exposure_penalty - shield_bonus
+
+                    if score < best_score:
+                        best_score = score
+                        best_roof = roof
+                        best_approach_2d = (approach_x, approach_y)
+                        best_climb_edge = (qx, qy, roof.top)
+                        best_energy_cost = energy_cost
+                        best_dist_approach = dist_approach
+                        best_shielded = shielded
+
+        evaluate_indices(query_indices)
+
+        # Fallback to broader search if closest 5 were energy-starved
+        if best_roof is None and len(self.rooftop_list) > k_search:
+            _, broader_indices = self.kdtree.query([mx, my], k=min(12, len(self.rooftop_list)))
+            evaluate_indices(list(broader_indices)[k_search:])
+
+        if best_roof is None or best_approach_2d is None or best_climb_edge is None:
+            t_elapsed = (time.perf_counter() - t0) * 1000.0
+            self.query_count += 1
+            self.total_query_time_ms += t_elapsed
+            return None
+
+        # Build full target once outside inner loop for maximum performance
+        approach_z = self.get_ground_elevation(best_approach_2d[0], best_approach_2d[1])
+        perch = self.get_safe_perch_point(best_roof, enemy_pos)
+        safe_exit = best_roof.drop_points[0] if best_roof.drop_points else None
+
+        best_target = RooftopEscapeTarget(
+            roof_id=best_roof.id,
+            roof_name=best_roof.name,
+            roof_top=best_roof.top,
+            roof_height=best_roof.height,
+            energy_cost=best_energy_cost,
+            ground_approach=(best_approach_2d[0], best_approach_2d[1], approach_z),
+            climb_edge=best_climb_edge,
+            perch_point=perch,
+            dist_to_approach=best_dist_approach,
+            safe_exit=safe_exit,
+            shielded_from_enemy=best_shielded,
+            score=best_score
+        )
 
         t_elapsed = (time.perf_counter() - t0) * 1000.0
         self.query_count += 1
@@ -778,37 +811,56 @@ class RooftopManager:
         ex, ey, ez = float(enemy_ground_pos[0]), float(enemy_ground_pos[1]), float(enemy_ground_pos[2])
         px, py, pz = float(perch_pos[0]), float(perch_pos[1]), float(perch_pos[2])
 
-        # Enemy muzzle altitude
         muzzle_z = ez + MUZZLE_HEIGHT
 
-        # Find closest roof edge between enemy and perch
-        min_edge_dist = float("inf")
-        edge_pt = None
+        # If enemy muzzle is above roof top, edge cannot occlude
+        if muzzle_z >= roof.top:
+            return False
 
+        # Find the roof edge segment intersecting the line segment (enemy -> perch)
+        def ccw(A, B, C):
+            return (C[1] - A[1]) * (B[0] - A[0]) > (B[1] - A[1]) * (C[0] - A[0])
+
+        intersect_pt = None
         for p1, p2 in roof.edges[:len(roof.ring)]:
-            dist, qx, qy = point_segment_distance(px, py, p1[0], p1[1], p2[0], p2[1])
-            if dist < min_edge_dist:
-                min_edge_dist = dist
-                edge_pt = (qx, qy)
+            # Test segment intersection between (enemy, perch) and (p1, p2)
+            if (ccw((ex, ey), (px, py), p1) != ccw((ex, ey), (px, py), p2)) and \
+               (ccw((ex, ey), p1, p2) != ccw((px, py), p1, p2)):
+                dx1 = px - ex
+                dy1 = py - ey
+                dx2 = p2[0] - p1[0]
+                dy2 = p2[1] - p1[1]
+                denom = dx1 * dy2 - dy1 * dx2
+                if abs(denom) > 1e-6:
+                    t = ((p1[0] - ex) * dy2 - (p1[1] - ey) * dx2) / denom
+                    intersect_pt = (ex + t * dx1, ey + t * dy1)
+                    break
 
-        if edge_pt is None or min_edge_dist < 0.1:
-            return False  # Mech is on the edge!
+        if intersect_pt is not None:
+            dist_enemy_to_edge = math.hypot(intersect_pt[0] - ex, intersect_pt[1] - ey)
+            dist_edge_to_perch = math.hypot(px - intersect_pt[0], py - intersect_pt[1])
+        else:
+            # Fallback: closest edge to perch
+            min_edge_dist = float("inf")
+            edge_pt = None
+            for p1, p2 in roof.edges[:len(roof.ring)]:
+                dist, qx, qy = point_segment_distance(px, py, p1[0], p1[1], p2[0], p2[1])
+                if dist < min_edge_dist:
+                    min_edge_dist = dist
+                    edge_pt = (qx, qy)
+            if edge_pt is None or min_edge_dist < 0.1:
+                return False
+            dist_enemy_to_edge = math.hypot(edge_pt[0] - ex, edge_pt[1] - ey)
+            dist_edge_to_perch = min_edge_dist
 
-        # Distance from enemy to edge
-        dist_enemy_to_edge = math.hypot(edge_pt[0] - ex, edge_pt[1] - ey)
         if dist_enemy_to_edge < 1e-3:
             return False
 
-        # Ray slope over the roof edge
         delta_z = roof.top - muzzle_z
         ray_slope = delta_z / dist_enemy_to_edge
+        ray_height_at_perch = roof.top + dist_edge_to_perch * ray_slope
 
-        # Ray height at the mech perch position
-        ray_height_at_perch = roof.top + min_edge_dist * ray_slope
-
-        # Mech top of head is at pz + MECH_HEIGHT
-        # Mech eye is at pz + EYE_HEIGHT
-        # If ray_height_at_perch > pz + EYE_HEIGHT, line of sight to eye/head is broken!
+        # Line of sight is occluded if ray passes at or above eye level
         return ray_height_at_perch >= (pz + EYE_HEIGHT)
 
     # -----------------------------------------------------------------
@@ -849,23 +901,19 @@ class RooftopManager:
 
         for dp in roof.drop_points:
             lx, ly, lz = dp.ground_pos
-            # Distance from landing spot to zone center
             dist_to_zone = math.hypot(lx - zx, ly - zy)
 
-            # Alignment bonus: dot product of exit normal with direction to zone
             v_zone_x = zx - dp.edge_pos[0]
             v_zone_y = zy - dp.edge_pos[1]
             z_len = math.hypot(v_zone_x, v_zone_y)
             alignment = (dp.exit_vec[0] * (v_zone_x / z_len) + dp.exit_vec[1] * (v_zone_y / z_len)) if z_len > 0.01 else 0.0
 
-            # Enemy avoidance: heavily penalize landing within 20m of ground enemy
             enemy_penalty = 0.0
             if ex is not None and ey is not None:
                 dist_enemy = math.hypot(lx - ex, ly - ey)
                 if dist_enemy < 25.0:
                     enemy_penalty = 50.0 * (1.0 - dist_enemy / 25.0)
 
-            # Lower score is better
             score = dist_to_zone - 25.0 * alignment + enemy_penalty
 
             if score < best_score:
@@ -897,14 +945,10 @@ class RooftopManager:
         z = float(pos[2]) if len(pos) > 2 else 0.0
 
         for roof in self.rooftop_list:
-            # Quick altitude check
             if abs(z - roof.top) <= 1.5 or (roof.top - 0.5 <= z <= roof.top + MECH_HEIGHT):
-                # Bounding box check
                 min_x, max_x, min_y, max_y = roof.bounds
                 if min_x <= x <= max_x and min_y <= y <= max_y:
-                    # Point in polygon check
                     if point_in_polygon(x, y, roof.ring):
-                        # Ensure not inside an inner courtyard hole
                         in_hole = any(point_in_polygon(x, y, h) for h in roof.holes)
                         if not in_hole:
                             return roof
@@ -943,7 +987,6 @@ class RooftopManager:
         # Stage 5 & 6: Already on top of roof
         if mz >= target.roof_top - 0.5 and is_grounded:
             if dist_to_perch > 1.5:
-                # Walk to safe perch point
                 yaw = math.atan2(py - my, px - mx)
                 return {
                     "move": [math.cos(yaw), math.sin(yaw)],
@@ -952,7 +995,6 @@ class RooftopManager:
                     "stage": "ADVANCING_TO_PERCH"
                 }
             else:
-                # Stationary at safe perch point: 45 HP/s healing active!
                 return {
                     "move": [0.0, 0.0],
                     "jump": False,
@@ -976,7 +1018,7 @@ class RooftopManager:
             return {
                 "move": [math.cos(yaw), math.sin(yaw)],
                 "jump": False,
-                "boost": True,  # Boost in air triggers upward jetting!
+                "boost": True,
                 "stage": "JETTING_UP"
             }
 
@@ -985,14 +1027,13 @@ class RooftopManager:
             yaw = math.atan2(cx - mx, cy - my)
             return {
                 "move": [math.cos(yaw), math.sin(yaw)],
-                "jump": True,   # Initiate jump!
+                "jump": True,
                 "boost": False,
                 "stage": "JUMPING"
             }
 
         # Stage 1: Running toward ground approach point
         yaw = math.atan2(gy - my, gx - mx)
-        # Sprint if far and plenty of surplus energy
         should_boost = dist_to_approach > 15.0 and current_energy > target.energy_cost + 25.0
         return {
             "move": [math.cos(yaw), math.sin(yaw)],
@@ -1022,20 +1063,16 @@ class RooftopManager:
         if current_roof is None:
             return False, "NOT_ON_ROOFTOP"
 
-        # Mortar threat evacuation
         if mortar_threat:
             return True, "MORTAR_EVACUATION"
 
-        # Zone safety evaluation
         next_center = zone_info.get("next_center", zone_info.get("center", [0.0, 0.0]))
         next_radius = zone_info.get("next_radius", zone_info.get("radius", 380.0))
         dist_to_next_center = math.hypot(current_roof.center[0] - next_center[0], current_roof.center[1] - next_center[1])
 
-        # If rooftop is outside next zone circle or near edge with shrink active
         if dist_to_next_center > (next_radius - 20.0):
             return True, "ZONE_CLOSING_DESCENT"
 
-        # Combat reset completed: full health restored
         if current_hp >= max_hp * 0.92 and time_since_combat >= REGEN_DELAY:
             return True, "RESET_COMPLETE_DESCENT"
 
@@ -1117,16 +1154,14 @@ if __name__ == "__main__":
 
     assert len(mgr.rooftop_list) > 50, "Expected > 50 verified rooftops"
 
-    # Print representative rooftops
     print("\n--- Representative Rooftops (Height 10m-25m with >= 3m Setback) ---")
     for r in mgr.rooftop_list[:5]:
-        print(f"  * [{r.id}] {r.name:25s} | H={r.height:4.1f}m | Top={r.top:4.1f}m | Area={r.area:5.0f}m² | Usable(>=3m)={r.usable_area:5.0f}m² | MaxSetback={r.max_setback:4.1f}m | Drops={len(r.drop_points)}")
+        print(f"  * [{r.id:3d}] {r.name:25s} | H={r.height:4.1f}m | Top={r.top:4.1f}m | Area={r.area:5.0f}m² | Usable(>=3m)={r.usable_area:5.0f}m² | MaxSetback={r.max_setback:4.1f}m | Drops={len(r.drop_points)}")
 
     # 2. Test Jump-Jet Energy Calculation
     print("\n--- Test 1: Jump-Jet Climb Energy Calculation ---")
     for h in [10.0, 15.0, 20.0, 25.0]:
         cost = RooftopManager.calculate_climb_energy(h)
-        # Cost for 15m roof should be ~35-36 energy
         print(f"  Height = {h:4.1f}m -> Jump-Jet Energy Cost = {cost:4.1f} (Regens in {cost/ENERGY_REGEN:.2f}s)")
     assert 34.0 <= RooftopManager.calculate_climb_energy(15.0) <= 37.0
 
@@ -1146,48 +1181,42 @@ if __name__ == "__main__":
 
     # 4. Test 3-Meter Roof-Edge Setback Rule
     print("\n--- Test 3: The 3-Meter Roof-Edge Setback Rule ---")
-    roof = mgr.rooftop_list[0]
-    perch = mgr.get_safe_perch_point(roof, sample_enemy)
-    # Verify distance from all edges is >= 3.0m
-    min_edge_dist = float("inf")
-    for p1, p2 in roof.edges:
-        d, _, _ = point_segment_distance(perch[0], perch[1], p1[0], p1[1], p2[0], p2[1])
-        if d < min_edge_dist:
-            min_edge_dist = d
-    print(f"  Rooftop [{roof.name}]: Selected Perch Point ({perch[0]:.1f}, {perch[1]:.1f}, {perch[2]:.1f})")
-    print(f"  Minimum distance to any roof edge: {min_edge_dist:.2f}m (Rule requires >= 3.0m)")
-    assert min_edge_dist >= 2.95, f"Setback rule violation: distance {min_edge_dist:.2f}m < 3.0m"
+    # Test on Pomerene Hall (ID 21, Top 16.1m, Height 16.6m)
+    pomerene = mgr.rooftops.get(21, mgr.rooftop_list[0])
+    pomerene_enemy = [pomerene.center[0] - 60.0, pomerene.center[1], 0.0]
+    perch = mgr.get_safe_perch_point(pomerene, pomerene_enemy)
+    min_edge_dist = min(point_segment_distance(perch[0], perch[1], e[0][0], e[0][1], e[1][0], e[1][1])[0] for e in pomerene.edges)
+    print(f"  Rooftop [{pomerene.name}]: Selected Perch Point ({perch[0]:.1f}, {perch[1]:.1f}, {perch[2]:.1f})")
+    print(f"  Continuous minimum distance to all roof edges: {min_edge_dist:.2f}m (Rule requires >= 3.0m)")
+    assert min_edge_dist >= 3.0, f"Setback rule violation: distance {min_edge_dist:.2f}m < 3.0m"
 
-    # Test ground LOS occlusion
-    los_broken = mgr.check_ground_los_occluded(roof, perch, sample_enemy)
+    los_broken = mgr.check_ground_los_occluded(pomerene, perch, pomerene_enemy)
     print(f"  Ground enemy muzzle LOS occluded by roof edge: {los_broken}")
 
     # 5. Test Safe Drop-Down & Exit Vectors
     print("\n--- Test 4: Safe Drop-Down & Exit Vectors ---")
     zone_center = [0.0, 0.0]
-    exit_vector = mgr.get_safe_exit_vector(roof, zone_center, sample_enemy)
+    exit_vector = mgr.get_safe_exit_vector(pomerene, zone_center, pomerene_enemy)
     assert exit_vector is not None, "Failed to calculate safe exit vector"
     print(f"  Drop Edge Position: ({exit_vector['edge_pos'][0]:.1f}, {exit_vector['edge_pos'][1]:.1f}, {exit_vector['edge_pos'][2]:.1f})")
     print(f"  Exit Normal Vector: ({exit_vector['exit_vec'][0]:.2f}, {exit_vector['exit_vec'][1]:.2f})")
     print(f"  Ground Landing Spot: ({exit_vector['ground_pos'][0]:.1f}, {exit_vector['ground_pos'][1]:.1f}, {exit_vector['ground_pos'][2]:.1f})")
-    print(f"  Ground Walkable: {mgr.is_ground_walkable(exit_vector['ground_pos'][0], exit_vector['ground_pos'][1])} (Guaranteed Zero Fall Damage!)")
+    is_walkable = mgr.is_ground_walkable(exit_vector['ground_pos'][0], exit_vector['ground_pos'][1])
+    print(f"  Ground Walkable: {is_walkable} (Guaranteed Zero Fall Damage!)")
+    assert is_walkable is True, "Landing spot must be verified walkable ground"
 
     # 6. Test Climb Controller Stages
     print("\n--- Test 5: Climb Action Controller State Machine ---")
-    # Ground approach stage
     act1 = mgr.compute_climb_action([150.0, -300.0, 0.0], escape, is_grounded=True, current_energy=75.0)
-    print(f"  Far from wall: stage={act1['stage']}, jump={act1['jump']}, boost={act1['boost']}")
-    # At wall base stage
+    print(f"  Far from wall:   stage={act1['stage']:18s} | jump={act1['jump']} | boost={act1['boost']}")
     act2 = mgr.compute_climb_action(escape.ground_approach, escape, is_grounded=True, current_energy=75.0)
-    print(f"  At wall base:  stage={act2['stage']}, jump={act2['jump']}, boost={act2['boost']}")
+    print(f"  At wall base:    stage={act2['stage']:18s} | jump={act2['jump']} | boost={act2['boost']}")
     assert act2["jump"] is True, "Must jump when at wall base"
-    # Jetting in air stage
     act3 = mgr.compute_climb_action([escape.climb_edge[0], escape.climb_edge[1], escape.roof_top - 5.0], escape, is_grounded=False, current_energy=60.0)
-    print(f"  In air climbing: stage={act3['stage']}, jump={act3['jump']}, boost={act3['boost']}")
+    print(f"  In air climbing: stage={act3['stage']:18s} | jump={act3['jump']} | boost={act3['boost']}")
     assert act3["boost"] is True, "Must jet (boost in air) while climbing"
-    # Perched stage
     act4 = mgr.compute_climb_action(escape.perch_point, escape, is_grounded=True, current_energy=100.0)
-    print(f"  At safe perch: stage={act4['stage']}, move={act4['move']} (45 HP/s healing active!)")
+    print(f"  At safe perch:   stage={act4['stage']:18s} | move={act4['move']} (45 HP/s healing active!)")
     assert act4["stage"] == "PERCHED_REGEN"
 
     # 7. Rigorous Computational Budget Benchmark
@@ -1235,7 +1264,6 @@ if __name__ == "__main__":
         mgr.is_on_rooftop(mpos)
         times_on_roof.append((time.perf_counter() - t0) * 1000.0)
 
-    # Latency table
     benchmarks = [
         ("find_nearest_rooftop_escape", times_escape),
         ("get_safe_perch_point", times_perch),
