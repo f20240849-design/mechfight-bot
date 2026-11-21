@@ -635,19 +635,24 @@ class RooftopManager:
 
         mx, my = float(my_pos[0]), float(my_pos[1])
         mz = float(my_pos[2]) if len(my_pos) > 2 else self.get_ground_elevation(mx, my)
+        ex, ey, ez = (float(enemy_pos[0]), float(enemy_pos[1]), float(enemy_pos[2])) if enemy_pos is not None else (None, None, None)
 
         # High-performance spatial query: retrieve the 5 closest rooftops via cKDTree
         k_search = min(5, len(self.rooftop_list))
         _, candidate_indices = self.kdtree.query([mx, my], k=k_search)
         query_indices = [candidate_indices] if np.isscalar(candidate_indices) else list(candidate_indices)
 
-        best_target: Optional[RooftopEscapeTarget] = None
+        best_roof: Optional[Rooftop] = None
+        best_approach_2d: Optional[Tuple[float, float]] = None
+        best_climb_edge: Optional[Tuple[float, float, float]] = None
+        best_energy_cost: float = 0.0
+        best_dist_approach: float = 0.0
+        best_shielded: bool = False
         best_score = float("inf")
 
-        ex, ey, ez = (float(enemy_pos[0]), float(enemy_pos[1]), float(enemy_pos[2])) if enemy_pos is not None else (None, None, None)
-
         def evaluate_indices(indices):
-            nonlocal best_target, best_score
+            nonlocal best_roof, best_approach_2d, best_climb_edge, best_energy_cost
+            nonlocal best_dist_approach, best_shielded, best_score
             for idx in indices:
                 roof = self.rooftop_list[idx]
                 h_diff = roof.top - mz
@@ -659,7 +664,10 @@ class RooftopManager:
                 if energy < energy_cost:
                     continue
 
-                # Evaluate each outer edge segment of this rooftop to find the optimal approach
+                v_eb_x = roof.center[0] - ex if ex is not None else 0.0
+                v_eb_y = roof.center[1] - ey if ey is not None else 0.0
+
+                # Evaluate outer boundary segments of this rooftop
                 for p1, p2 in roof.edges[:len(roof.ring)]:
                     dist_to_seg, qx, qy = point_segment_distance(mx, my, p1[0], p1[1], p2[0], p2[1])
 
@@ -673,20 +681,14 @@ class RooftopManager:
 
                     approach_x = qx + nx_out * 2.5
                     approach_y = qy + ny_out * 2.5
-                    approach_z = self.get_ground_elevation(approach_x, approach_y)
                     dist_approach = math.hypot(approach_x - mx, approach_y - my)
-
-                    climb_edge_point = (qx, qy, roof.top)
 
                     shielded = False
                     exposure_penalty = 0.0
 
                     if ex is not None and ey is not None:
-                        v_eb_x = roof.center[0] - ex
-                        v_eb_y = roof.center[1] - ey
                         v_ba_x = approach_x - roof.center[0]
                         v_ba_y = approach_y - roof.center[1]
-
                         dot_prod = v_eb_x * v_ba_x + v_eb_y * v_ba_y
                         if dot_prod > 0.0:
                             shielded = True
@@ -699,31 +701,46 @@ class RooftopManager:
                     score = dist_approach + 0.4 * energy_cost + exposure_penalty - shield_bonus
 
                     if score < best_score:
-                        perch = self.get_safe_perch_point(roof, enemy_pos)
-                        safe_exit = roof.drop_points[0] if roof.drop_points else None
-
                         best_score = score
-                        best_target = RooftopEscapeTarget(
-                            roof_id=roof.id,
-                            roof_name=roof.name,
-                            roof_top=roof.top,
-                            roof_height=roof.height,
-                            energy_cost=energy_cost,
-                            ground_approach=(approach_x, approach_y, approach_z),
-                            climb_edge=climb_edge_point,
-                            perch_point=perch,
-                            dist_to_approach=dist_approach,
-                            safe_exit=safe_exit,
-                            shielded_from_enemy=shielded,
-                            score=score
-                        )
+                        best_roof = roof
+                        best_approach_2d = (approach_x, approach_y)
+                        best_climb_edge = (qx, qy, roof.top)
+                        best_energy_cost = energy_cost
+                        best_dist_approach = dist_approach
+                        best_shielded = shielded
 
         evaluate_indices(query_indices)
 
         # Fallback to broader search if closest 5 were energy-starved
-        if best_target is None and len(self.rooftop_list) > k_search:
+        if best_roof is None and len(self.rooftop_list) > k_search:
             _, broader_indices = self.kdtree.query([mx, my], k=min(12, len(self.rooftop_list)))
             evaluate_indices(list(broader_indices)[k_search:])
+
+        if best_roof is None or best_approach_2d is None or best_climb_edge is None:
+            t_elapsed = (time.perf_counter() - t0) * 1000.0
+            self.query_count += 1
+            self.total_query_time_ms += t_elapsed
+            return None
+
+        # Build full target once outside inner loop for maximum performance
+        approach_z = self.get_ground_elevation(best_approach_2d[0], best_approach_2d[1])
+        perch = self.get_safe_perch_point(best_roof, enemy_pos)
+        safe_exit = best_roof.drop_points[0] if best_roof.drop_points else None
+
+        best_target = RooftopEscapeTarget(
+            roof_id=best_roof.id,
+            roof_name=best_roof.name,
+            roof_top=best_roof.top,
+            roof_height=best_roof.height,
+            energy_cost=best_energy_cost,
+            ground_approach=(best_approach_2d[0], best_approach_2d[1], approach_z),
+            climb_edge=best_climb_edge,
+            perch_point=perch,
+            dist_to_approach=best_dist_approach,
+            safe_exit=safe_exit,
+            shielded_from_enemy=best_shielded,
+            score=best_score
+        )
 
         t_elapsed = (time.perf_counter() - t0) * 1000.0
         self.query_count += 1
