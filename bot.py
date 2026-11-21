@@ -304,7 +304,9 @@ class Bot:
             t
         )
         should_fire = art_res.get("fire", [False, False])
-        if art_res.get("aim") and closest_enemy and (me["weapons"][1] and me["weapons"][1].get("kind") in ("laser", "mortar")):
+        if art_res.get("tactical_move") == "SIEGE_DROP":
+            torso_aim = (art_res["aim"][0], art_res["aim"][1])
+        elif art_res.get("aim") and closest_enemy and (me["weapons"][1] and me["weapons"][1].get("kind") in ("laser", "mortar")):
             torso_aim = (art_res["aim"][0], art_res["aim"][1])
 
         # If in combat reset, aim at enemy to protect rear armor, and ONLY cease fire once LOS is broken!
@@ -312,7 +314,7 @@ class Bot:
             dx = closest_enemy["pos"][0] - x
             dy = closest_enemy["pos"][1] - y
             torso_aim = (math.atan2(dy, dx), 0.0)
-            if not has_enemy_los:
+            if not has_enemy_los and not (me["weapons"][1] and me["weapons"][1].get("kind") == "mortar"):
                 should_fire = [False, False]
 
         # 6. Motion Planning (Waypoints via A*)
@@ -337,8 +339,8 @@ class Bot:
                 if mlen > 0.01:
                     move_vec = [move_vec[0] / mlen, move_vec[1] / mlen]
 
-        # If not actively aiming at enemy, look in direction of movement
-        if not closest_enemy or not has_enemy_los:
+        # If not actively aiming at enemy or indirect artillery, look in direction of movement
+        if (not closest_enemy or not has_enemy_los) and not (should_fire[0] or should_fire[1]):
             torso_aim = (move_yaw, 0.0)
 
         action.update(
