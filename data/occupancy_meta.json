@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "nx": 1070,
+  "ny": 724,
+  "step": 1.0,
+  "minX": -513.0,
+  "maxX": 556.0,
+  "minY": -334.0,
+  "maxY": 389.0,
+  "mech_radius": 2.5,
+  "mech_height": 9.0,
+  "legend": {
+    "0": "walkable",
+    "1": "solid_obstacle",
+    "2": "wall_buffer"
+  },
+  "stats": {
+    "total_cells": 774680,
+    "walkable_cells": 555135,
+    "buffer_cells": 42384,
+    "solid_cells": 177161,
+    "walkable_bridges": 4,
+    "blocked_bridges": 5
+  },
+  "formulas": {
+    "world_to_grid": "col = round((x - minX) / step); row = round((y - minY) / step)",
+    "grid_to_world": "x = minX + col * step; y = minY + row * step",
+    "index": "index = row * nx + col"
+  }
+}
