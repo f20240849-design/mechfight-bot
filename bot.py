@@ -3,6 +3,8 @@ Disciplined Opportunist: Tournament-winning MechRoyale Bot.
 Implements the high-level brain, out-of-combat 45 HP/s resets, rear-armor protection,
 ballistic lead prediction, and supply-drop ambushes.
 """
+import atexit
+import json
 import math
 import os
 import sys
@@ -34,30 +36,76 @@ class Bot:
         self.current_waypoints: List[Tuple[float, float]] = []
         self.active_state = "SPAWN"
 
-        # Upgrade priority ranking
+        # Complete upgrade priority ranking (all 22 upgrades from config)
         self.upgrade_ranks = {
-            "nanites": 100,       # +60% out-of-combat regen, starts at 3.5s!
-            "plating": 90,        # +15% max HP
-            "armor": 85,          # -8% damage taken
-            "servos": 80,         # +8% speed (outrunning rushers)
-            "reactor": 75,        # +30% energy regen
-            "laser_charge": 70,   # -25% laser charge time
-            "laser_damage": 68,   # +18% laser damage
-            "gun_rate": 65,       # +15% gun fire rate
-            "gun_damage": 60,     # +15% gun damage
-            "lightning_range": 55,# +20% lightning range
-            "jets": 50            # -25% jet drain
+            "nanites": 100,             # +60% out-of-combat regen, starts 1.5s sooner (powers combat resets!)
+            "armor": 92,                # -8% damage taken (multiplicative effective HP)
+            "plating": 88,              # +15% max HP
+            "servos": 85,               # +8% speed (boosts transverse strafe dodging vs naive bots)
+            "gun_mag": 80,              # +8 rounds, -20% reload time (less reload vulnerability)
+            "gun_rate": 76,             # +15% arm gun fire rate
+            "gun_damage": 72,           # +15% arm gun damage
+            "gun_velocity": 70,         # +25% arm gun projectile speed (even easier to lead)
+            "laser_charge": 68,         # -25% laser charge time
+            "laser_damage": 65,         # +18% laser damage
+            "laser_pierce": 63,         # laser passes through one more target
+            "lightning_range": 60,      # +20% lightning range and cone
+            "lightning_efficiency": 58, # -35% lightning energy cost, +10% damage
+            "lightning_chain": 55,      # +1 lightning chain jump
+            "reactor": 50,              # +30% energy regen
+            "sensors": 45,              # +15m proximity sensors, +25m vision
+            "jets": 40,                 # -25% boost & jet drain
+            "capacitor": 35,            # +30 max energy
+            "gyros": 30,                # +30% aim turn rate
+            "mortar_reload": 20,        # -18% mortar cooldown
+            "mortar_velocity": 15,      # +20% shell speed
+            "mortar_splash": 10         # +30% mortar splash radius
         }
+
+        # Match Telemetry Tracker
+        self.telemetry = {
+            "ticks": 0,
+            "damage_dealt": 0.0,
+            "damage_taken": 0.0,
+            "kills": 0,
+            "cubes": 0,
+            "drops_captured": 0,
+            "upgrades": [],
+            "last_place": 16
+        }
+        atexit.register(self.log_telemetry)
+
+    def log_telemetry(self):
+        try:
+            summary = json.dumps(self.telemetry)
+            sys.stderr.write(f"[MATCH_TELEMETRY] {summary}\n")
+            sys.stderr.flush()
+            with open("/tmp/match_telemetry.jsonl", "a") as f:
+                f.write(summary + "\n")
+        except Exception:
+            pass
 
     def _update_memory(self, obs: mf.Observation):
         t = obs["t"]
+        self.telemetry["ticks"] += 1
+        self.telemetry["cubes"] = obs["self"].get("cubes", 0)
+        self.telemetry["last_place"] = obs.get("alive", 16)
+
         # Track combat events
         for ev in obs.get("events", []):
             ev_type = ev.get("type")
             if ev_type == "damaged":
                 self.last_damaged_time = t
+                self.telemetry["damage_taken"] += ev.get("amount", 0)
             elif ev_type == "hit":
                 self.last_attack_time = t
+                self.telemetry["damage_dealt"] += ev.get("amount", 0)
+            elif ev_type == "kill":
+                self.telemetry["kills"] += 1
+            elif ev_type == "drop":
+                self.telemetry["drops_captured"] += 1
+            elif ev_type == "upgrade":
+                self.telemetry["upgrades"].append(ev.get("id"))
 
         # Track enemies (persisting for 5s)
         for m in obs.get("mechs", []):
@@ -189,11 +237,11 @@ class Bot:
             d_lands_in = drop.get("lands_in", 0.0)
             d_holder = drop.get("holder")
 
-            if d_lands_in <= 10.0 and d_dist < 100.0:
-                if d_holder is None and (not visible_enemies or enemy_dist > 60.0):
+            if d_dist < 250.0:
+                if d_holder is None and (not visible_enemies or enemy_dist > 50.0):
                     self.active_state = "DROP_CAPTURE"
                     nav_target = (d_pos[0], d_pos[1])
-                    should_boost = d_dist > 15.0
+                    should_boost = d_dist > 20.0 and d_lands_in <= 5.0
                 else:
                     self.active_state = "DROP_AMBUSH"
                     ambush_pos = (d_pos[0] - 50.0, d_pos[1] - 20.0)
@@ -204,11 +252,9 @@ class Bot:
             should_engage, _ = self.combat.evaluate_fight(my_hp, me["weapons"], me.get("cubes", 0), closest_enemy)
             if should_engage or enemy_dist < 45.0:
                 self.active_state = "ENGAGE"
-                if enemy_dist < 35.0:
-                    kmove = self.combat.compute_kiting_move([x, y], closest_enemy["pos"], nav_target, tick)
-                    nav_target = (x + kmove[0] * 20.0, y + kmove[1] * 20.0)
-                else:
-                    nav_target = (closest_enemy["pos"][0], closest_enemy["pos"][1])
+                # Use transverse combat strafing: orbits at 50-80m to dodge unled naive bot shots
+                combat_move = self.combat.compute_combat_move([x, y], closest_enemy["pos"], tick)
+                nav_target = (x + combat_move[0] * 20.0, y + combat_move[1] * 20.0)
             else:
                 self.active_state = "STALKING"
 
@@ -262,7 +308,6 @@ class Bot:
             torso_aim = (math.atan2(dy, dx), 0.0)
             if not has_enemy_los:
                 should_fire = [False, False]
-            should_fire = [False, False]
 
         # 6. Motion Planning (Waypoints via A*)
         path = self.nav.plan_path((x, y), nav_target)

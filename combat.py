@@ -129,3 +129,52 @@ class CombatSystem:
             move_y /= mlen
 
         return [move_x, move_y]
+
+    def compute_combat_move(
+        self,
+        my_pos: List[float],
+        enemy_pos: List[float],
+        tick: int = 0
+    ) -> List[float]:
+        """
+        Calculates transverse strafing against naive bots (who aim without lead).
+        Maintains desired standoff distance (50m - 80m) while oscillating laterally.
+        At 60m+, moving perpendicularly at 11.7 m/s displaces the bot by > 3.0m during
+        bullet flight time, completely dodging direct-aimed unled gun shells.
+        """
+        if tick - self.last_strafe_tick > self.strafe_period:
+            self.strafe_dir = -self.strafe_dir
+            self.last_strafe_tick = tick
+
+        dx = enemy_pos[0] - my_pos[0]
+        dy = enemy_pos[1] - my_pos[1]
+        dist = math.hypot(dx, dy)
+        if dist < 0.01:
+            return [1.0, 0.0]
+
+        # Unit vector toward enemy
+        to_x = dx / dist
+        to_y = dy / dist
+
+        # Perpendicular vector (tangential orbit)
+        perp_x = -to_y * self.strafe_dir
+        perp_y = to_x * self.strafe_dir
+
+        if dist < 45.0:
+            rad_weight = -0.7  # Backpedal away to maintain range
+            perp_weight = 0.5
+        elif dist > 85.0:
+            rad_weight = 0.5   # Close in
+            perp_weight = 0.6
+        else:
+            rad_weight = 0.0   # Pure perpendicular strafe!
+            perp_weight = 1.0
+
+        move_x = to_x * rad_weight + perp_x * perp_weight
+        move_y = to_y * rad_weight + perp_y * perp_weight
+
+        mlen = math.hypot(move_x, move_y)
+        if mlen > 0.01:
+            move_x /= mlen
+            move_y /= mlen
+        return [move_x, move_y]
