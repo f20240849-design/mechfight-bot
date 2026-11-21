@@ -15,6 +15,7 @@ from nav import NavMesh
 from ballistics import Ballistics
 from combat import CombatSystem
 from acoustics import AcousticRadar
+from artillery import ArtillerySystem
 
 class Bot:
     name = "opportunist-v1"
@@ -28,6 +29,7 @@ class Bot:
         self.ballistics = Ballistics(self.config)
         self.combat = CombatSystem(self.config)
         self.radar = AcousticRadar()
+        self.artillery = ArtillerySystem(self.config)
 
         # Tactical memory
         self.seen_enemies: Dict[int, Dict[str, Any]] = {}
@@ -131,39 +133,9 @@ class Bot:
                 best_idx = idx
         return best_idx
 
-    def _handle_loot_swaps(self, me: Dict[str, Any], pickups: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        """Evaluates ground loot within reach and picks up the best weapons."""
-        pickup_radius = self.config.get("loot", {}).get("pickup_radius", 4.0)
-        x, y, _ = me["pos"]
-        w0 = me["weapons"][0]
-        w1 = me["weapons"][1]
-
-        # Find pickups in reach
-        near_pickups = [
-            p for p in pickups
-            if math.hypot(p["pos"][0] - x, p["pos"][1] - y) <= pickup_radius
-        ]
-        if not near_pickups:
-            return None
-
-        # Priority: Laser > Lightning > Mortar
-        loot_rank = {"laser": 3, "lightning": 2, "mortar": 1, "gun": 0}
-        near_pickups.sort(key=lambda p: loot_rank.get(p.get("kind", ""), 0), reverse=True)
-        best_pickup = near_pickups[0]
-        p_kind = best_pickup.get("kind")
-        p_id = best_pickup.get("id")
-
-        held_kinds = [w["kind"] for w in (w0, w1) if w is not None]
-
-        # Case 1: Empty slot available
-        if w1 is None and p_kind not in held_kinds:
-            return {"take": p_id}
-
-        # Case 2: Both full, but we hold Gun and want Laser/Lightning
-        if w0 and w0["kind"] == "gun" and p_kind in ("laser", "lightning") and p_kind not in held_kinds:
-            return {"take": p_id, "drop": 0}
-
-        return None
+    def _handle_loot_swaps(self, me: Dict[str, Any], pickups: List[Dict[str, Any]], enemies: Optional[List[Dict[str, Any]]] = None, t: float = 0.0) -> Optional[Dict[str, Any]]:
+        """Delegates to SmartWeaponSwapManager from artillery system."""
+        return self.artillery.swap_manager.evaluate_swap(me, pickups, enemies, t)
 
     def act(self, obs: mf.Observation) -> mf.Action:
         me = obs["self"]
@@ -181,16 +153,16 @@ class Bot:
             action["pick"] = self._choose_upgrade(obs["offer"])
 
         # 2. Handle weapon pickups
-        loot_action = self._handle_loot_swaps(me, obs.get("pickups", []))
+        visible_enemies = [m for m in obs.get("mechs", []) if m.get("kind") == "mech"]
+        visible_enemies.sort(key=lambda m: math.hypot(m["pos"][0] - x, m["pos"][1] - y))
+
+        loot_action = self._handle_loot_swaps(me, obs.get("pickups", []), visible_enemies, t)
         if loot_action:
             action.update(loot_action)
 
         # 3. Assess threats & combat status
         time_since_combat = t - max(self.last_damaged_time, self.last_attack_time)
         in_combat_reset = time_since_combat >= 5.0  # 45 HP/s active healing!
-
-        visible_enemies = [m for m in obs.get("mechs", []) if m.get("kind") == "mech"]
-        visible_enemies.sort(key=lambda m: math.hypot(m["pos"][0] - x, m["pos"][1] - y))
 
         closest_enemy = visible_enemies[0] if visible_enemies else None
         enemy_dist = math.hypot(closest_enemy["pos"][0] - x, closest_enemy["pos"][1] - y) if closest_enemy else 1e9
@@ -219,15 +191,26 @@ class Bot:
             nav_target = (zone_center[0], zone_center[1])
             should_boost = is_outside
 
-        # --- Priority 2: Combat Reset / Cover Retreat ---
-        elif closest_enemy and my_hp < 500:
-            should_engage, _ = self.combat.evaluate_fight(my_hp, me["weapons"], me.get("cubes", 0), closest_enemy)
-            if not should_engage:
-                self.active_state = "COMBAT_RESET"
-                cover = self.nav.find_cover_spot((x, y), (closest_enemy["pos"][0], closest_enemy["pos"][1]))
-                if cover:
-                    nav_target = cover
-                should_boost = enemy_dist < 30.0
+        # --- Priority 2: Cover Retreat / Combat Reset ---
+        # Retreat to cover if:
+        # 1. Under 800 HP
+        # 2. Or fight evaluation is unfavorable (ratio < 0.85)
+        # 3. Or enemy holds Laser while we only have starter gun and are in open
+        # 4. Or enemy is currently charging a Laser!
+        elif closest_enemy and (
+            my_hp < 800
+            or not self.combat.evaluate_fight(my_hp, me["weapons"], me.get("cubes", 0), closest_enemy)[0]
+            or ("laser" in closest_enemy.get("weapons", []) and me["weapons"][1] is None and enemy_dist > 45.0)
+            or closest_enemy.get("charging", False)
+        ):
+            self.active_state = "COMBAT_RESET"
+            cover = self.nav.find_cover_spot((x, y), (closest_enemy["pos"][0], closest_enemy["pos"][1]))
+            if cover:
+                nav_target = cover
+            else:
+                kmove = self.combat.compute_kiting_move([x, y], closest_enemy["pos"], None, tick)
+                nav_target = (x + kmove[0] * 25.0, y + kmove[1] * 25.0)
+            should_boost = enemy_dist < 40.0 or closest_enemy.get("charging", False)
 
         # --- Priority 3: Supply Drop Snatch / Ambush ---
         elif obs.get("drops") and t > 65.0:
@@ -247,18 +230,13 @@ class Bot:
                     ambush_pos = (d_pos[0] - 50.0, d_pos[1] - 20.0)
                     nav_target = ambush_pos
 
-        # --- Priority 4: Tactical Combat (Always defend or press advantage) ---
+        # --- Priority 4: Tactical Combat (Engage with Transverse Strafing) ---
         elif closest_enemy:
-            should_engage, _ = self.combat.evaluate_fight(my_hp, me["weapons"], me.get("cubes", 0), closest_enemy)
-            if should_engage or enemy_dist < 45.0:
-                self.active_state = "ENGAGE"
-                # Use transverse combat strafing: orbits at 50-80m to dodge unled naive bot shots
-                combat_move = self.combat.compute_combat_move([x, y], closest_enemy["pos"], tick)
-                nav_target = (x + combat_move[0] * 20.0, y + combat_move[1] * 20.0)
-            else:
-                self.active_state = "STALKING"
+            self.active_state = "ENGAGE"
+            combat_move = self.combat.compute_combat_move([x, y], closest_enemy["pos"], tick)
+            nav_target = (x + combat_move[0] * 20.0, y + combat_move[1] * 20.0)
 
-        # --- Priority 5: Safe Farm (Shoot crates & harvest cubes) ---
+        # --- Priority 5: Safe Farm (Harvest Loose Cubes, Floor Weapons, Crates) ---
         else:
             self.active_state = "SAFE_FARM"
             death_pos = self.radar.find_recent_death_event()
@@ -266,8 +244,22 @@ class Bot:
                 self.active_state = "THIRD_PARTY_AMBUSH"
                 nav_target = (death_pos[0], death_pos[1])
             else:
+                cubes = obs.get("cubes", [])
+                pickups = [p for p in obs.get("pickups", []) if p.get("kind") in ("laser", "lightning", "mortar")]
                 crates = obs.get("crates", [])
-                if crates:
+
+                # 1. Loose power cubes (free +4% HP & dmg, 0 ammo needed)
+                if cubes:
+                    cubes.sort(key=lambda c: math.hypot(c["pos"][0] - x, c["pos"][1] - y))
+                    nav_target = (cubes[0]["pos"][0], cubes[0]["pos"][1])
+                    should_boost = math.hypot(cubes[0]["pos"][0] - x, cubes[0]["pos"][1] - y) > 20.0
+                # 2. Floor weapons (Laser / Lightning / Mortar)
+                elif pickups and (me["weapons"][1] is None or me["weapons"][0]["kind"] == "gun"):
+                    pickups.sort(key=lambda p: math.hypot(p["pos"][0] - x, p["pos"][1] - y))
+                    nav_target = (pickups[0]["pos"][0], pickups[0]["pos"][1])
+                    should_boost = math.hypot(pickups[0]["pos"][0] - x, pickups[0]["pos"][1] - y) > 25.0
+                # 3. Unopened crates
+                elif crates:
                     crates.sort(key=lambda c: math.hypot(c["pos"][0] - x, c["pos"][1] - y))
                     target_crate = crates[0]
                     nav_target = (target_crate["pos"][0], target_crate["pos"][1])
@@ -286,27 +278,43 @@ class Bot:
         if closest_enemy:
             has_enemy_los = self.nav.has_los(x, y, closest_enemy["pos"][0], closest_enemy["pos"][1])
             if has_enemy_los:
-                yaw, pitch, _ = self.ballistics.compute_lead_aim(
-                    [x, y, z],
-                    closest_enemy["pos"],
-                    closest_enemy.get("vel", [0, 0, 0]),
-                    self.ballistics.gun_speed
-                )
+                w1 = me["weapons"][1]
+                w0 = me["weapons"][0]
+                holds_laser = (w1 and w1.get("kind") == "laser") or (w0 and w0.get("kind") == "laser")
+                if holds_laser:
+                    yaw, pitch = self.ballistics.compute_laser_aim([x, y, z], closest_enemy["pos"])
+                else:
+                    yaw, pitch, _ = self.ballistics.compute_lead_aim(
+                        [x, y, z],
+                        closest_enemy["pos"],
+                        closest_enemy.get("vel", [0, 0, 0]),
+                        self.ballistics.gun_speed
+                    )
                 torso_aim = (yaw, pitch)
-                
-                should_fire = self.ballistics.decide_weapon_triggers(
-                    me["weapons"],
-                    closest_enemy,
-                    enemy_dist,
-                    has_enemy_los
-                )
+
+        # Unified Artillery & Weapon evaluation (Laser peek, Lightning cone, Mortar siege, Gun burst)
+        art_res = self.artillery.evaluate_combat_tick(
+            me,
+            closest_enemy,
+            has_enemy_los,
+            obs.get("pickups", []),
+            obs.get("drops"),
+            visible_enemies,
+            not has_enemy_los,
+            t
+        )
+        should_fire = art_res.get("fire", [False, False])
+        if art_res.get("tactical_move") == "SIEGE_DROP":
+            torso_aim = (art_res["aim"][0], art_res["aim"][1])
+        elif art_res.get("aim") and closest_enemy and (me["weapons"][1] and me["weapons"][1].get("kind") in ("laser", "mortar")):
+            torso_aim = (art_res["aim"][0], art_res["aim"][1])
 
         # If in combat reset, aim at enemy to protect rear armor, and ONLY cease fire once LOS is broken!
         if self.active_state == "COMBAT_RESET" and closest_enemy:
             dx = closest_enemy["pos"][0] - x
             dy = closest_enemy["pos"][1] - y
             torso_aim = (math.atan2(dy, dx), 0.0)
-            if not has_enemy_los:
+            if not has_enemy_los and not (me["weapons"][1] and me["weapons"][1].get("kind") == "mortar"):
                 should_fire = [False, False]
 
         # 6. Motion Planning (Waypoints via A*)
@@ -331,8 +339,8 @@ class Bot:
                 if mlen > 0.01:
                     move_vec = [move_vec[0] / mlen, move_vec[1] / mlen]
 
-        # If not actively aiming at enemy, look in direction of movement
-        if not closest_enemy or not has_enemy_los:
+        # If not actively aiming at enemy or indirect artillery, look in direction of movement
+        if (not closest_enemy or not has_enemy_los) and not (should_fire[0] or should_fire[1]):
             torso_aim = (move_yaw, 0.0)
 
         action.update(
