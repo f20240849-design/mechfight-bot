@@ -17,6 +17,7 @@ from combat import CombatSystem
 from acoustics import AcousticRadar
 from artillery import ArtillerySystem
 from gatekeeper import ZoneGatekeeper, Chokepoint
+from rooftops import RooftopManager, RooftopEscapeTarget, is_on_rooftop
 
 class Bot:
     name = "opportunist-v1"
@@ -32,6 +33,7 @@ class Bot:
         self.radar = AcousticRadar()
         self.artillery = ArtillerySystem(self.config)
         self.gatekeeper = ZoneGatekeeper(map_dir)
+        self.rooftops = RooftopManager(map_dir)
 
         # Tactical memory
         self.seen_enemies: Dict[int, Dict[str, Any]] = {}
@@ -40,6 +42,7 @@ class Bot:
         self.current_waypoints: List[Tuple[float, float]] = []
         self.active_state = "SPAWN"
         self.gatekeep_aim_yaw = 0.0
+        self.active_escape: Optional[RooftopEscapeTarget] = None
 
         # Complete upgrade priority ranking (all 22 upgrades from config)
         self.upgrade_ranks = {
@@ -189,8 +192,36 @@ class Bot:
             (x, y), zone, my_speed=11.7, current_time=t
         )
 
+        # 0. Check Rooftop Verticality Status
+        current_roof = self.rooftops.is_on_rooftop([x, y, z])
+        energy = float(me.get("energy", 100.0))
+
+        # --- Priority 0: Active Rooftop Control & Safe Descent ---
+        if current_roof:
+            should_descend, descend_reason = self.rooftops.should_descend(
+                [x, y, z], zone, my_hp, me.get("max_hp", 1400.0), time_since_combat
+            )
+            if should_descend:
+                # Initiate safe zero-fall-damage descent into ground cover toward zone center
+                exit_info = self.rooftops.get_safe_exit_vector(
+                    current_roof, (zone_center[0], zone_center[1]), closest_enemy["pos"] if closest_enemy else None
+                )
+                if exit_info:
+                    self.active_state = "ROOFTOP_EXIT"
+                    nav_target = (exit_info["ground_pos"][0], exit_info["ground_pos"][1])
+                    should_boost = is_outside
+            else:
+                # Hold safe 3m setback perch point: out-of-combat 45 HP/s active healing!
+                self.active_state = "ROOFTOP_PERCH"
+                perch_pt = self.rooftops.get_safe_perch_point(
+                    current_roof, closest_enemy["pos"] if closest_enemy else None
+                )
+                nav_target = (perch_pt[0], perch_pt[1])
+                # Cease fire to allow full HP regeneration
+                should_fire = [False, False]
+
         # --- Priority 1: Endgame Survival Engine (< 5 alive) ---
-        if self.gatekeeper.is_endgame(alive_count, next_radius):
+        elif self.gatekeeper.is_endgame(alive_count, next_radius):
             self.active_state = "ENDGAME_SURVIVAL"
             endgame_pos = self.gatekeeper.get_endgame_position((x, y), zone, alive_count)
             nav_target = endgame_pos
@@ -247,14 +278,31 @@ class Bot:
             or ("laser" in closest_enemy.get("weapons", []) and me["weapons"][1] is None and enemy_dist > 45.0)
             or closest_enemy.get("charging", False)
         ):
-            self.active_state = "COMBAT_RESET"
-            cover = self.nav.find_cover_spot((x, y), (closest_enemy["pos"][0], closest_enemy["pos"][1]))
-            if cover:
-                nav_target = cover
+            # Check for immediate jump-jet rooftop escape: ground bots cannot follow!
+            roof_escape = self.rooftops.find_nearest_rooftop_escape([x, y, z], closest_enemy["pos"], energy)
+            if roof_escape and roof_escape.dist_to_approach < 55.0:
+                self.active_state = "ROOFTOP_ESCAPE"
+                climb_act = self.rooftops.compute_climb_action([x, y, z], roof_escape, me.get("grounded", True), energy)
+                if climb_act.get("jump"):
+                    action["jump"] = True
+                should_boost = climb_act.get("boost", False)
+                if climb_act["stage"] == "APPROACHING_WALL":
+                    nav_target = (roof_escape.ground_approach[0], roof_escape.ground_approach[1])
+                elif climb_act["stage"] in ("JUMPING", "JETTING_UP"):
+                    nav_target = (roof_escape.climb_edge[0], roof_escape.climb_edge[1])
+                else:
+                    nav_target = (roof_escape.perch_point[0], roof_escape.perch_point[1])
+                if climb_act["stage"] == "PERCHED_REGEN":
+                    should_fire = [False, False]
             else:
-                kmove = self.combat.compute_kiting_move([x, y], closest_enemy["pos"], None, tick)
-                nav_target = (x + kmove[0] * 25.0, y + kmove[1] * 25.0)
-            should_boost = enemy_dist < 40.0 or closest_enemy.get("charging", False)
+                self.active_state = "COMBAT_RESET"
+                cover = self.nav.find_cover_spot((x, y), (closest_enemy["pos"][0], closest_enemy["pos"][1]))
+                if cover:
+                    nav_target = cover
+                else:
+                    kmove = self.combat.compute_kiting_move([x, y], closest_enemy["pos"], None, tick)
+                    nav_target = (x + kmove[0] * 25.0, y + kmove[1] * 25.0)
+                should_boost = enemy_dist < 40.0 or closest_enemy.get("charging", False)
 
         # --- Priority 3: Supply Drop Snatch / Ambush ---
         elif obs.get("drops") and t > 65.0:
@@ -353,8 +401,8 @@ class Bot:
         elif art_res.get("aim") and closest_enemy and (me["weapons"][1] and me["weapons"][1].get("kind") in ("laser", "mortar")):
             torso_aim = (art_res["aim"][0], art_res["aim"][1])
 
-        # If in combat reset, aim at enemy to protect rear armor, and ONLY cease fire once LOS is broken!
-        if self.active_state == "COMBAT_RESET" and closest_enemy:
+        # If in combat reset or rooftop escape/perch, aim at enemy to protect rear armor, and cease fire once LOS is broken!
+        if self.active_state in ("COMBAT_RESET", "ROOFTOP_ESCAPE", "ROOFTOP_PERCH") and closest_enemy:
             dx = closest_enemy["pos"][0] - x
             dy = closest_enemy["pos"][1] - y
             torso_aim = (math.atan2(dy, dx), 0.0)
