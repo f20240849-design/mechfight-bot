@@ -72,8 +72,8 @@ class CombatSystem:
         # Ratio of survival time vs kill time
         ratio = ttk_me / max(ttk_them, 0.01)
 
-        # Engage if we have a decisive advantage (ratio > 1.3)
-        should_engage = ratio > 1.3
+        # Engage if we have a viable fight (ratio >= 0.85)
+        should_engage = ratio >= 0.85
         return should_engage, ratio
 
     def compute_kiting_move(

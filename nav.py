@@ -1,6 +1,6 @@
 """
 Navigation, Line-of-Sight, and Cover System for MechRoyale.
-Uses the precomputed 2D occupancy grid (1m resolution).
+Uses the precomputed 2D occupancy grid (1m resolution) with 2m A* pathfinding.
 """
 import json
 import os
@@ -45,10 +45,11 @@ class NavMesh:
             # 0=walkable (clearance >= 2.5m), 1=solid wall, 2=near wall buffer (<2.5m)
             self.grid = np.frombuffer(f.read(), dtype=np.uint8).reshape((self.ny, self.nx))
             
-        # 4m downsampled grid for ultra-fast long-range A* (step=4m)
-        self.scale = 4
-        self.grid_4m = self.grid[::self.scale, ::self.scale] != 0
-        self.h_4m, self.w_4m = self.grid_4m.shape
+        # 2m downsampled grid (step = 2.0m)
+        self.scale = 2
+        walkable_1m = (self.grid == 0)
+        self.grid_2m = ~walkable_1m[::self.scale, ::self.scale]  # True = blocked
+        self.h_2m, self.w_2m = self.grid_2m.shape
 
     def world_to_grid(self, x: float, y: float) -> Tuple[int, int]:
         col = int(round((x - self.min_x) / self.step))
@@ -74,39 +75,41 @@ class NavMesh:
         # grid == 1 is solid wall; 0 and 2 allow vision/shots
         return not np.any(self.grid[rows, cols] == 1)
 
-    def find_nearest_walkable(self, x: float, y: float, max_radius: int = 10) -> Tuple[float, float]:
-        col, row = self.world_to_grid(x, y)
-        if self.grid[row, col] == 0:
-            return x, y
-        # Spiral outward
-        for r in range(1, max_radius + 1):
-            for dc in range(-r, r + 1):
-                for dr in (-r, r):
-                    nc, nr = col + dc, row + dr
-                    if 0 <= nc < self.nx and 0 <= nr < self.ny and self.grid[nr, nc] == 0:
-                        return self.grid_to_world(nc, nr)
-            for dr in range(-r + 1, r):
-                for dc in (-r, r):
-                    nc, nr = col + dc, row + dr
-                    if 0 <= nc < self.nx and 0 <= nr < self.ny and self.grid[nr, nc] == 0:
-                        return self.grid_to_world(nc, nr)
-        return x, y
+    def find_nearest_walkable_2m(self, col_2m: int, row_2m: int, max_radius: int = 15) -> Tuple[int, int]:
+        c = max(0, min(self.w_2m - 1, col_2m))
+        r = max(0, min(self.h_2m - 1, row_2m))
+        if not self.grid_2m[r, c]:
+            return c, r
+        for radius in range(1, max_radius + 1):
+            for dr in range(-radius, radius + 1):
+                for dc in (-radius, radius):
+                    nr, nc = r + dr, c + dc
+                    if 0 <= nr < self.h_2m and 0 <= nc < self.w_2m and not self.grid_2m[nr, nc]:
+                        return nc, nr
+            for dc in range(-radius + 1, radius):
+                for dr in (-radius, radius):
+                    nr, nc = r + dr, c + dc
+                    if 0 <= nr < self.h_2m and 0 <= nc < self.w_2m and not self.grid_2m[nr, nc]:
+                        return nc, nr
+        return c, r
 
     def plan_path(self, start_pos: Tuple[float, float], goal_pos: Tuple[float, float]) -> List[Tuple[float, float]]:
-        """A* path on 4m grid with line-of-sight shortcutting."""
-        sx, sy = self.find_nearest_walkable(start_pos[0], start_pos[1])
-        gx, gy = self.find_nearest_walkable(goal_pos[0], goal_pos[1])
+        """A* path on 2m grid with line-of-sight shortcutting."""
+        sx, sy = start_pos[0], start_pos[1]
+        gx, gy = goal_pos[0], goal_pos[1]
         
-        # If direct line of sight exists and distance < 80m, go straight!
-        dist = math.hypot(gx - sx, gy - sy)
-        if dist < 80.0 and self.has_los(sx, sy, gx, gy):
+        # If direct line of sight exists, go straight!
+        if self.has_los(sx, sy, gx, gy):
             return [(gx, gy)]
-            
-        # 4m grid coordinates
-        c0, r0 = int((sx - self.min_x) / (self.step * self.scale)), int((sy - self.min_y) / (self.step * self.scale))
-        c1, r1 = int((gx - self.min_x) / (self.step * self.scale)), int((gy - self.min_y) / (self.step * self.scale))
-        c0, r0 = max(0, min(self.w_4m - 1, c0)), max(0, min(self.h_4m - 1, r0))
-        c1, r1 = max(0, min(self.w_4m - 1, c1)), max(0, min(self.h_4m - 1, r1))
+
+        # Convert to 2m grid coords
+        c0 = int(round((sx - self.min_x) / (self.step * self.scale)))
+        r0 = int(round((sy - self.min_y) / (self.step * self.scale)))
+        c1 = int(round((gx - self.min_x) / (self.step * self.scale)))
+        r1 = int(round((gy - self.min_y) / (self.step * self.scale)))
+
+        c0, r0 = self.find_nearest_walkable_2m(c0, r0)
+        c1, r1 = self.find_nearest_walkable_2m(c1, r1)
 
         if (c0, r0) == (c1, r1):
             return [(gx, gy)]
@@ -119,13 +122,14 @@ class NavMesh:
                 (-1, -1, 1.414), (-1, 1, 1.414), (1, -1, 1.414), (1, 1, 1.414)]
 
         nodes_visited = 0
-        max_nodes = 800  # Cap search to stay well within 2 ms
+        max_nodes = 2500  # Cap search to stay under 5ms
         reached = False
+        end_node = (r1, c1)
 
         while pq and nodes_visited < max_nodes:
             nodes_visited += 1
             f, r, c = heapq.heappop(pq)
-            if (r, c) == (c1, r1) or math.hypot(r - r1, c - c1) <= 1:
+            if (r, c) == (r1, c1) or (abs(r - r1) <= 1 and abs(c - c1) <= 1):
                 reached = True
                 end_node = (r, c)
                 break
@@ -133,7 +137,7 @@ class NavMesh:
             g = cost[(r, c)]
             for dr, dc, dcost in dirs:
                 nr, nc = r + dr, c + dc
-                if 0 <= nr < self.h_4m and 0 <= nc < self.w_4m and not self.grid_4m[nr, nc]:
+                if 0 <= nr < self.h_2m and 0 <= nc < self.w_2m and not self.grid_2m[nr, nc]:
                     ng = g + dcost
                     if ng < cost.get((nr, nc), 1e9):
                         cost[(nr, nc)] = ng
@@ -142,8 +146,12 @@ class NavMesh:
                         parent[(nr, nc)] = (r, c)
 
         if not reached:
-            # Fallback direct
-            return [(gx, gy)]
+            # Fallback to closest explored node toward goal
+            if parent:
+                best_n = min(parent.keys(), key=lambda n: math.hypot(r1 - n[0], c1 - n[1]))
+                end_node = best_n
+            else:
+                return [(gx, gy)]
 
         # Reconstruct path
         path_nodes = []
@@ -153,11 +161,14 @@ class NavMesh:
             curr = parent[curr]
         path_nodes.reverse()
 
+        if not path_nodes:
+            return [(gx, gy)]
+
         # Convert back to world coordinates
         raw_waypoints = []
         for r, c in path_nodes:
-            wx = self.min_x + (c + 0.5) * self.step * self.scale
-            wy = self.min_y + (r + 0.5) * self.step * self.scale
+            wx = self.min_x + c * self.step * self.scale
+            wy = self.min_y + r * self.step * self.scale
             raw_waypoints.append((wx, wy))
         raw_waypoints.append((gx, gy))
 
@@ -178,11 +189,11 @@ class NavMesh:
 
         return smooth_path
 
-    def find_cover_spot(self, my_pos: Tuple[float, float], threat_pos: Tuple[float, float], min_dist: float = 35.0, max_dist: float = 65.0) -> Optional[Tuple[float, float]]:
+    def find_cover_spot(self, my_pos: Tuple[float, float], threat_pos: Tuple[float, float], min_dist: float = 30.0, max_dist: float = 60.0) -> Optional[Tuple[float, float]]:
         """Find a nearby cell that breaks line-of-sight from threat_pos."""
         my_col, my_row = self.world_to_grid(my_pos[0], my_pos[1])
         radius_cells = int(max_dist / self.step)
-        step_stride = 3  # check every 3m for speed
+        step_stride = 3
 
         best_spot = None
         best_score = -1e9
@@ -196,9 +207,7 @@ class NavMesh:
                     dist_to_me = math.hypot(cand_x - my_pos[0], cand_y - my_pos[1])
                     
                     if min_dist <= dist_to_threat and dist_to_me <= max_dist:
-                        # Check if this cell breaks LOS to the threat
                         if not self.has_los(cand_x, cand_y, threat_pos[0], threat_pos[1]):
-                            # Score: prefer spots closer to me, farther from threat
                             score = -dist_to_me + dist_to_threat * 0.5
                             if score > best_score:
                                 best_score = score
