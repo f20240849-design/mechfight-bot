@@ -271,43 +271,16 @@ class Bot:
                 self.active_state = "ZONE_ROTATION"
                 should_boost = is_outside or eta_seconds > max(1.0, shrink_start - t)
 
-        # --- Priority 2: Cover Retreat / Combat Reset ---
-        # Retreat to cover if:
-        # 1. Under 800 HP
-        # 2. Or fight evaluation is unfavorable (ratio < 0.85)
-        # 3. Or enemy holds Laser while we only have starter gun and are in open
-        # 4. Or enemy is currently charging a Laser!
-        elif closest_enemy and (
-            my_hp < 800
-            or not self.combat.evaluate_fight(my_hp, me["weapons"], me.get("cubes", 0), closest_enemy)[0]
-            or ("laser" in closest_enemy.get("weapons", []) and me["weapons"][1] is None and enemy_dist > 45.0)
-            or closest_enemy.get("charging", False)
-        ):
-            # Check for immediate jump-jet rooftop escape: ground bots cannot follow!
-            roof_escape = self.rooftops.find_nearest_rooftop_escape([x, y, z], closest_enemy["pos"], energy)
-            if roof_escape and roof_escape.dist_to_approach < 55.0:
-                self.active_state = "ROOFTOP_ESCAPE"
-                climb_act = self.rooftops.compute_climb_action([x, y, z], roof_escape, me.get("grounded", True), energy)
-                if climb_act.get("jump"):
-                    action["jump"] = True
-                should_boost = climb_act.get("boost", False)
-                if climb_act["stage"] == "APPROACHING_WALL":
-                    nav_target = (roof_escape.ground_approach[0], roof_escape.ground_approach[1])
-                elif climb_act["stage"] in ("JUMPING", "JETTING_UP"):
-                    nav_target = (roof_escape.climb_edge[0], roof_escape.climb_edge[1])
-                else:
-                    nav_target = (roof_escape.perch_point[0], roof_escape.perch_point[1])
-                if climb_act["stage"] == "PERCHED_REGEN":
-                    should_fire = [False, False]
+        # --- Priority 2: Critical Combat Reset / Cover Retreat (< 450 HP or Point-Blank Charging Laser) ---
+        elif closest_enemy and (my_hp < 450 or (closest_enemy.get("charging", False) and enemy_dist < 35.0)):
+            self.active_state = "COMBAT_RESET"
+            cover = self.nav.find_cover_spot((x, y), (closest_enemy["pos"][0], closest_enemy["pos"][1]))
+            if cover:
+                nav_target = cover
             else:
-                self.active_state = "COMBAT_RESET"
-                cover = self.nav.find_cover_spot((x, y), (closest_enemy["pos"][0], closest_enemy["pos"][1]))
-                if cover:
-                    nav_target = cover
-                else:
-                    kmove = self.combat.compute_kiting_move([x, y], closest_enemy["pos"], None, tick)
-                    nav_target = (x + kmove[0] * 25.0, y + kmove[1] * 25.0)
-                should_boost = enemy_dist < 40.0 or closest_enemy.get("charging", False)
+                kmove = self.combat.compute_kiting_move([x, y], closest_enemy["pos"], None, tick)
+                nav_target = (x + kmove[0] * 25.0, y + kmove[1] * 25.0)
+            should_boost = enemy_dist < 35.0
 
         # --- Priority 3: Supply Drop Snatch / Ambush ---
         elif obs.get("drops") and t > 65.0:
@@ -331,7 +304,8 @@ class Bot:
         elif closest_enemy:
             self.active_state = "ENGAGE"
             combat_move = self.combat.compute_combat_move([x, y], closest_enemy["pos"], tick)
-            nav_target = (x + combat_move[0] * 20.0, y + combat_move[1] * 20.0)
+            nav_target = (x + combat_move[0] * 25.0, y + combat_move[1] * 25.0)
+            should_boost = enemy_dist < 35.0
 
         # --- Priority 5: Safe Farm (Harvest Loose Cubes, Floor Weapons, Crates) ---
         else:
@@ -345,16 +319,16 @@ class Bot:
                 pickups = [p for p in obs.get("pickups", []) if p.get("kind") in ("laser", "lightning", "mortar")]
                 crates = obs.get("crates", [])
 
-                # 1. Loose power cubes (free +4% HP & dmg, 0 ammo needed)
-                if cubes:
+                # 1. Floor weapons FIRST (Laser / Lightning / Mortar) if slot 1 is empty!
+                if me["weapons"][1] is None and pickups:
+                    pickups.sort(key=lambda p: math.hypot(p["pos"][0] - x, p["pos"][1] - y))
+                    nav_target = (pickups[0]["pos"][0], pickups[0]["pos"][1])
+                    should_boost = math.hypot(pickups[0]["pos"][0] - x, pickups[0]["pos"][1] - y) > 15.0
+                # 2. Loose power cubes (free +4% HP & dmg, 0 ammo needed)
+                elif cubes:
                     cubes.sort(key=lambda c: math.hypot(c["pos"][0] - x, c["pos"][1] - y))
                     nav_target = (cubes[0]["pos"][0], cubes[0]["pos"][1])
                     should_boost = math.hypot(cubes[0]["pos"][0] - x, cubes[0]["pos"][1] - y) > 20.0
-                # 2. Floor weapons (Laser / Lightning / Mortar)
-                elif pickups and (me["weapons"][1] is None or me["weapons"][0]["kind"] == "gun"):
-                    pickups.sort(key=lambda p: math.hypot(p["pos"][0] - x, p["pos"][1] - y))
-                    nav_target = (pickups[0]["pos"][0], pickups[0]["pos"][1])
-                    should_boost = math.hypot(pickups[0]["pos"][0] - x, pickups[0]["pos"][1] - y) > 25.0
                 # 3. Unopened crates
                 elif crates:
                     crates.sort(key=lambda c: math.hypot(c["pos"][0] - x, c["pos"][1] - y))
@@ -400,11 +374,19 @@ class Bot:
             not has_enemy_los,
             t
         )
-        should_fire = art_res.get("fire", [False, False])
+        art_fire = art_res.get("fire", [False, False])
+        should_fire = [should_fire[0] or art_fire[0], should_fire[1] or art_fire[1]]
         if art_res.get("tactical_move") == "SIEGE_DROP":
             torso_aim = (art_res["aim"][0], art_res["aim"][1])
         elif art_res.get("aim") and closest_enemy and (me["weapons"][1] and me["weapons"][1].get("kind") in ("laser", "mortar")):
             torso_aim = (art_res["aim"][0], art_res["aim"][1])
+
+        # Gun trigger discipline: only fire at enemy if aim yaw is reasonably aligned (< 0.22 rad / 12.6 deg)!
+        if closest_enemy:
+            curr_yaw = me.get("aim", [0.0, 0.0])[0]
+            yaw_err = abs(math.atan2(math.sin(torso_aim[0] - curr_yaw), math.cos(torso_aim[0] - curr_yaw)))
+            if yaw_err > 0.22 and not (me["weapons"][1] and me["weapons"][1].get("kind") == "mortar"):
+                should_fire[0] = False
 
         # If in combat reset or rooftop escape/perch, aim at enemy to protect rear armor, and cease fire once LOS is broken!
         if self.active_state in ("COMBAT_RESET", "ROOFTOP_ESCAPE", "ROOFTOP_PERCH") and closest_enemy:
