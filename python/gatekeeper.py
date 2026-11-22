@@ -275,17 +275,11 @@ class ZoneGatekeeper:
         # Compute traversal ETA
         eta_seconds = (total_dist / max(1.0, my_speed)) * obstacle_mult
 
-        # The Gatekeeper Ambush Doctrine:
-        # Standard naive bots rotate at shrink_start - 15.0s.
-        # We rotate early (ahead of the 15s warning) with an additional 12.0s tactical margin
-        # to arrive first, claim cover, and set up the ambush.
-        early_margin = 12.0  # Arrive early before naive bots scramble
+        # Safe rotation timing:
+        # Give a comfortable 5.0s safety buffer ahead of zone arrival,
+        # but do not panic-rotate 30 seconds prematurely when farming is critical.
         time_to_shrink = shrink_start - t
-
-        # Rotation triggers if:
-        # 1. We are currently outside the gas boundary
-        # 2. Time remaining until shrink is less than (travel ETA + 15s warning + early_margin)
-        needs_rotation = is_outside or (time_to_shrink <= (eta_seconds + 15.0 + early_margin))
+        needs_rotation = is_outside or (time_to_shrink <= (eta_seconds + 5.0))
 
         return bool(needs_rotation), float(eta_seconds)
 
