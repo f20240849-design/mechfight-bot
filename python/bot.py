@@ -200,6 +200,25 @@ class Bot:
         should_boost = False
         should_fire = [False, False]
 
+        # 0. Check Inventory & Weapons Status
+        w1 = me["weapons"][1]
+        w0 = me["weapons"][0]
+        holds_laser = (w1 and w1.get("kind") == "laser") or (w0 and w0.get("kind") == "laser")
+        holds_secondary = w1 is not None
+
+        floor_weapons = [p for p in obs.get("pickups", []) if p.get("kind") in ("laser", "lightning", "mortar")]
+        crates = obs.get("crates", [])
+        cubes = obs.get("cubes", [])
+
+        has_enemy_los = False
+        enemy_is_charging = False
+        enemy_holds_laser = False
+        if closest_enemy:
+            has_enemy_los = self.nav.has_los(x, y, closest_enemy["pos"][0], closest_enemy["pos"][1])
+            enemy_is_charging = closest_enemy.get("charging", False)
+            enemy_weapons = closest_enemy.get("weapons", [])
+            enemy_holds_laser = "laser" in enemy_weapons
+
         # 0. Check Zone Urgency & Gas Status
         is_outside = not me.get("in_zone", True)
         needs_zone_rotation, eta_seconds = self.gatekeeper.evaluate_rotation_urgency(
@@ -211,15 +230,14 @@ class Bot:
         current_roof = self.rooftops.is_on_rooftop([x, y, z])
         energy = float(me.get("energy", 100.0))
 
-        # --- Priority 0: Active Rooftop Control & Safe Descent ---
-        if current_roof:
-            should_descend, descend_reason = self.rooftops.should_descend(
-                [x, y, z], zone, my_hp, me.get("max_hp", 1400.0), time_since_combat,
-                is_outside=is_outside, shrink_imminent=shrink_imminent
-            )
-            # If outside zone or needs urgent rotation, FORCE immediate safe descent!
-            if should_descend or is_outside or needs_zone_rotation:
-                # Initiate safe zero-fall-damage descent into ground cover toward zone center
+        # =========================================================================
+        # UNIFIED STRATEGIC HIERARCHY (Strictly Mutually Exclusive Priorities)
+        # =========================================================================
+
+        # Priority 0: Zone Survival (Storm / Gas Escape)
+        # If in storm (is_outside) or rotation is urgent: MUST get to safe zone.
+        if is_outside or needs_zone_rotation or shrink_imminent:
+            if current_roof:
                 exit_info = self.rooftops.get_safe_exit_vector(
                     current_roof, (zone_center[0], zone_center[1]), closest_enemy["pos"] if closest_enemy else None
                 )
@@ -228,63 +246,23 @@ class Bot:
                     nav_target = (exit_info["ground_pos"][0], exit_info["ground_pos"][1])
                     should_boost = is_outside or eta_seconds > max(1.0, shrink_start - t)
             else:
-                # Hold safe 3m setback perch point: out-of-combat 45 HP/s active healing!
-                self.active_state = "ROOFTOP_PERCH"
-                perch_pt = self.rooftops.get_safe_perch_point(
-                    current_roof, closest_enemy["pos"] if closest_enemy else None
-                )
-                nav_target = (perch_pt[0], perch_pt[1])
-                # Cease fire to allow full HP regeneration
-                should_fire = [False, False]
-
-        # --- Priority 1: Endgame Survival Engine (< 5 alive) ---
-        elif self.gatekeeper.is_endgame(alive_count, next_radius):
-            self.active_state = "ENDGAME_SURVIVAL"
-            endgame_pos = self.gatekeeper.get_endgame_position((x, y), zone, alive_count)
-            nav_target = endgame_pos
-
-            # If enemy visible, check whether to avoid optional fight
-            if closest_enemy:
-                avoid_fight = self.gatekeeper.should_avoid_combat(alive_count, my_hp, closest_enemy, enemy_dist)
-                if avoid_fight:
-                    # Break LOS and stay in deep cover; do not shoot unless directly attacked
-                    cover = self.nav.find_cover_spot((x, y), (closest_enemy["pos"][0], closest_enemy["pos"][1]))
-                    if cover:
-                        nav_target = cover
-                    should_boost = enemy_dist < 30.0
-
-        # --- Priority 2: Zone Safety & Gatekeeper Ambush Doctrine ---
-        elif needs_zone_rotation:
-            chokes = self.gatekeeper.find_chokepoints(
-                zone.get("radius", 560.0),
-                (zone_center[0], zone_center[1]),
-                next_radius
-            )
-            gatekeep_target = self.gatekeeper.select_gatekeep_position((x, y), chokes)
-
-            # Check for Ohio Stadium pinch
-            is_pinched, bypass_wp = self.gatekeeper.is_stadium_pinch((x, y), gatekeep_target)
-            if is_pinched and bypass_wp:
-                nav_target = bypass_wp
-            else:
-                nav_target = gatekeep_target
-
-            dist_to_gatekeep = math.hypot(gatekeep_target[0] - x, gatekeep_target[1] - y)
-            is_in_safe_zone = dist_to_next_center < (next_radius - 12.0)
-
-            # If arrived early at the gatekeep ambush spot inside the safe zone:
-            if dist_to_gatekeep < 6.0 and is_in_safe_zone and not is_outside:
-                self.active_state = "GATEKEEP_AMBUSH"
-                if chokes:
-                    holding_yaw, holding_pitch = self.gatekeeper.get_ambush_aim((x, y), chokes[0])
-                    self.gatekeep_aim_yaw = holding_yaw
-                    torso_aim = (holding_yaw, holding_pitch)
-            else:
                 self.active_state = "ZONE_ROTATION"
+                chokes = self.gatekeeper.find_chokepoints(zone.get("radius", 560.0), (zone_center[0], zone_center[1]), next_radius)
+                gatekeep_target = self.gatekeeper.select_gatekeep_position((x, y), chokes)
+                is_pinched, bypass_wp = self.gatekeeper.is_stadium_pinch((x, y), gatekeep_target)
+                nav_target = bypass_wp if (is_pinched and bypass_wp) else gatekeep_target
                 should_boost = is_outside or eta_seconds > max(1.0, shrink_start - t)
 
-        # --- Priority 2: Critical Combat Reset / Cover Retreat (< 450 HP or Point-Blank Charging Laser) ---
-        elif closest_enemy and (my_hp < 450 or (closest_enemy.get("charging", False) and enemy_dist < 35.0)):
+        # Priority 1: Critical Combat Reset / Cover Retreat
+        # Triggered if:
+        # a) Low HP (< 500)
+        # b) Enemy is charging Laser with direct LOS and we don't have Laser
+        # c) Enemy holds Laser at long range (> 65m) while we only have Gun
+        elif closest_enemy and (
+            my_hp < 500.0
+            or (enemy_is_charging and has_enemy_los and not holds_laser)
+            or (enemy_holds_laser and enemy_dist > 65.0 and not holds_laser and has_enemy_los)
+        ):
             self.active_state = "COMBAT_RESET"
             cover = self.nav.find_cover_spot((x, y), (closest_enemy["pos"][0], closest_enemy["pos"][1]))
             if cover:
@@ -292,40 +270,67 @@ class Bot:
             else:
                 kmove = self.combat.compute_kiting_move([x, y], closest_enemy["pos"], None, tick)
                 nav_target = (x + kmove[0] * 25.0, y + kmove[1] * 25.0)
-            should_boost = enemy_dist < 35.0
+            should_boost = True
 
-        # --- Priority 3: Supply Drop Snatcher (CHOKE Drop Interceptor) ---
-        # Combat Priority Guard: If enemy is in close range (< 42m) or actively damaging us, engage in combat first!
-        drop_target = None
-        is_combat_busy = closest_enemy and (enemy_dist < 42.0 or time_since_combat < 2.5)
-        if not is_combat_busy:
-            drop_target = self.gatekeeper.evaluate_drop_objective((x, y), obs.get("drops", []), visible_enemies, t)
+        # Priority 2: Empty Weapon Slot 1 - Immediate Weapon Rush!
+        # If we have no secondary weapon and a high-tier weapon is nearby (< 90m): grab it!
+        elif not holds_secondary and floor_weapons and (
+            best_wp := min(floor_weapons, key=lambda p: math.hypot(p["pos"][0] - x, p["pos"][1] - y))
+        ) and math.hypot(best_wp["pos"][0] - x, best_wp["pos"][1] - y) < 90.0:
+            self.active_state = "WEAPON_RUSH"
+            nav_target = (best_wp["pos"][0], best_wp["pos"][1])
+            wp_dist = math.hypot(best_wp["pos"][0] - x, best_wp["pos"][1] - y)
+            should_boost = wp_dist > 15.0
 
-        if drop_target is not None:
+        # Priority 3: Rooftop Perch Healing (if on roof and safe)
+        elif current_roof:
+            self.active_state = "ROOFTOP_PERCH"
+            perch_pt = self.rooftops.get_safe_perch_point(current_roof, closest_enemy["pos"] if closest_enemy else None)
+            nav_target = (perch_pt[0], perch_pt[1])
+            should_fire = [False, False]
+
+        # Priority 4: Endgame Survival Engine (< 5 alive)
+        elif self.gatekeeper.is_endgame(alive_count, next_radius):
+            self.active_state = "ENDGAME_SURVIVAL"
+            endgame_pos = self.gatekeeper.get_endgame_position((x, y), zone, alive_count)
+            nav_target = endgame_pos
+            if closest_enemy and self.gatekeeper.should_avoid_combat(alive_count, my_hp, closest_enemy, enemy_dist):
+                cover = self.nav.find_cover_spot((x, y), (closest_enemy["pos"][0], closest_enemy["pos"][1]))
+                if cover:
+                    nav_target = cover
+
+        # Priority 5: Tactical Combat Engagement (within viable combat range)
+        # Viable range: <= 65m for Arm Gun, or <= 160m if we hold a Laser!
+        elif closest_enemy and (enemy_dist <= 65.0 or (holds_laser and enemy_dist <= 160.0)):
+            self.active_state = "ENGAGE"
+            combat_move = self.combat.compute_combat_move([x, y], closest_enemy["pos"], tick)
+            c_target = (x + combat_move[0] * 25.0, y + combat_move[1] * 25.0)
+            if not self.nav.is_walkable(c_target[0], c_target[1]):
+                combat_move_alt = [-combat_move[1], combat_move[0]]
+                alt_target = (x + combat_move_alt[0] * 25.0, y + combat_move_alt[1] * 25.0)
+                if self.nav.is_walkable(alt_target[0], alt_target[1]):
+                    c_target = alt_target
+            nav_target = c_target
+            should_boost = enemy_dist < 30.0
+
+        # Priority 6: Supply Drop Interception (if no close enemy threat)
+        elif obs.get("drops") and (
+            drop_target := self.gatekeeper.evaluate_drop_objective((x, y), obs.get("drops", []), visible_enemies, t)
+        ) is not None:
             self.active_state = "DROP_CAPTURE"
             nav_target = drop_target
             should_boost = math.hypot(drop_target[0] - x, drop_target[1] - y) > 15.0
 
-        # --- Priority 4: Tactical Combat (Engage with Transverse Strafing) ---
-        elif closest_enemy:
-            self.active_state = "ENGAGE"
-            combat_move = self.combat.compute_combat_move([x, y], closest_enemy["pos"], tick)
-            nav_target = (x + combat_move[0] * 25.0, y + combat_move[1] * 25.0)
-            should_boost = enemy_dist < 35.0
-
-        # --- Priority 5: Safe Farm & Perimeter Flank Orbit (ATLAS Flank Orbit Engine) ---
+        # Priority 7: Safe Farm & Flank Orbit (Loot, Crates, Perimeter)
         else:
             self.active_state = "SAFE_FARM"
             death_pos = self.radar.find_recent_death_event()
-            cubes = obs.get("cubes", [])
-            pickups = [p for p in obs.get("pickups", []) if p.get("kind") in ("laser", "lightning", "mortar")]
-            crates = obs.get("crates", [])
 
-            # 1. Floor weapons FIRST (Laser / Lightning / Mortar) if slot 1 is empty!
-            if me["weapons"][1] is None and pickups:
-                pickups.sort(key=lambda p: math.hypot(p["pos"][0] - x, p["pos"][1] - y))
-                nav_target = (pickups[0]["pos"][0], pickups[0]["pos"][1])
-                should_boost = math.hypot(pickups[0]["pos"][0] - x, pickups[0]["pos"][1] - y) > 15.0
+            # 1. Floor weapons if slot 1 is empty
+            if not holds_secondary and floor_weapons:
+                floor_weapons.sort(key=lambda p: math.hypot(p["pos"][0] - x, p["pos"][1] - y))
+                nav_target = (floor_weapons[0]["pos"][0], floor_weapons[0]["pos"][1])
+                should_boost = math.hypot(floor_weapons[0]["pos"][0] - x, floor_weapons[0]["pos"][1] - y) > 15.0
             # 2. Loose power cubes within 50m
             elif cubes and math.hypot(cubes[0]["pos"][0] - x, cubes[0]["pos"][1] - y) < 50.0:
                 cubes.sort(key=lambda c: math.hypot(c["pos"][0] - x, c["pos"][1] - y))
@@ -356,12 +361,7 @@ class Bot:
                 nav_target = flank_wp
 
         # 5. Weapon Aiming & Firing Execution
-        has_enemy_los = False
         if closest_enemy:
-            has_enemy_los = self.nav.has_los(x, y, closest_enemy["pos"][0], closest_enemy["pos"][1])
-            w1 = me["weapons"][1]
-            w0 = me["weapons"][0]
-            holds_laser = (w1 and w1.get("kind") == "laser") or (w0 and w0.get("kind") == "laser")
             if holds_laser and has_enemy_los:
                 yaw, pitch = self.ballistics.compute_laser_aim([x, y, z], closest_enemy["pos"])
             else:
