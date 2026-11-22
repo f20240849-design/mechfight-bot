@@ -96,13 +96,76 @@ class SupplyDropInterceptor:
         self,
         capture_radius: float = 8.0,
         capture_time: float = 4.0,
-        walk_speed: float = 11.7
+        walk_speed: float = 11.7,
+        gatekeeper: Optional[Any] = None
     ):
         self.capture_radius = capture_radius
         self.capture_time = capture_time
         self.walk_speed = walk_speed
+        self.gatekeeper = gatekeeper
         self.active_drop_id: Optional[int] = None
         self.is_capturing: bool = False
+        self.is_standoff: bool = False
+
+    def get_standoff_position(
+        self,
+        my_pos: Tuple[float, float],
+        drop_pos: Tuple[float, float],
+        standoff_dist: float = 45.0
+    ) -> Tuple[float, float]:
+        """
+        Computes a 45m standoff position with line-of-sight to the drop/enemy.
+        Vulcan Failure Mode 2 Guard: prevents walking into contested 8m ring killzone.
+        Instead, establishes a 45m standoff position with line-of-sight to shoot
+        the stationary capturing enemy.
+        """
+        my_x, my_y = float(my_pos[0]), float(my_pos[1])
+        drop_x, drop_y = float(drop_pos[0]), float(drop_pos[1])
+
+        dx = my_x - drop_x
+        dy = my_y - drop_y
+        dist_curr = math.hypot(dx, dy)
+        base_angle = math.atan2(dy, dx) if dist_curr > 0.1 else 0.0
+
+        # If already situated at ~45m (42-48m) with clear LOS and walkable, hold position!
+        if 42.0 <= dist_curr <= 48.0:
+            has_los = True
+            is_walk = True
+            if self.gatekeeper is not None:
+                has_los = self.gatekeeper.has_los(my_x, my_y, drop_x, drop_y)
+                is_walk = self.gatekeeper.is_walkable(my_x, my_y)
+            if has_los and is_walk:
+                return (my_x, my_y)
+
+        # Search angular offsets expanding outward from current approach angle
+        # Offsets in radians: 0, +15°, -15°, +30°, -30°, ... up to ±180°
+        angle_offsets = [0.0]
+        for deg in range(15, 181, 15):
+            rad = math.radians(deg)
+            angle_offsets.extend([rad, -rad])
+
+        # Test nominal 45m, with slight adjustments if blocked
+        radii = [standoff_dist, standoff_dist - 3.0, standoff_dist + 3.0, standoff_dist - 6.0, standoff_dist + 6.0]
+
+        for r in radii:
+            for d_th in angle_offsets:
+                th = base_angle + d_th
+                cx = drop_x + r * math.cos(th)
+                cy = drop_y + r * math.sin(th)
+
+                walkable = True
+                los = True
+                if self.gatekeeper is not None:
+                    walkable = self.gatekeeper.is_walkable(cx, cy)
+                    los = self.gatekeeper.has_los(cx, cy, drop_x, drop_y)
+
+                if walkable and los:
+                    return (round(cx, 1), round(cy, 1))
+
+        # Fallback along approach vector at exactly standoff_dist
+        fb_x = drop_x + standoff_dist * math.cos(base_angle)
+        fb_y = drop_y + standoff_dist * math.sin(base_angle)
+        return (round(fb_x, 1), round(fb_y, 1))
 
     def evaluate_drop_objective(
         self,
@@ -114,14 +177,19 @@ class SupplyDropInterceptor:
         """
         Evaluates active supply drops and determines if/when to intercept.
         1. When a drop beacon appears (obs["drops"]), path toward the landing coordinate
-           10 seconds before touchdown (or when t_arrival ≈ lands_in - 2.0s).
-        2. Once landed (lands_in <= 0), hold within the 8.0m capture radius for 4.0s
+           when traversal_eta >= (lands_in - 2.0).
+        2. Once landed (lands_in <= 0.0), hold within the 8.0m capture radius for 4.0s
            while maintaining aim at incoming approach paths.
-        3. Returns target coordinates (x, y) to move to, or None if no drop should be pursued.
+        3. Contested Ring Standoff (Vulcan Failure Mode 2 Guard):
+           If an enemy mech is ALREADY inside the 8m capture ring:
+           DO NOT step into the ring (avoid the sitting duck killzone).
+           Instead, establish a 45m standoff position with line-of-sight and shoot the stationary capturing enemy!
+        4. Returns target coordinates (x, y) to move to, or None if no drop should be pursued.
         """
         if not drops:
             self.active_drop_id = None
             self.is_capturing = False
+            self.is_standoff = False
             return None
 
         my_x, my_y = float(my_pos[0]), float(my_pos[1])
@@ -135,6 +203,7 @@ class SupplyDropInterceptor:
         if not valid_drops:
             self.active_drop_id = None
             self.is_capturing = False
+            self.is_standoff = False
             return None
 
         # Sort primarily by lands_in (soonest landing), then distance
@@ -145,9 +214,29 @@ class SupplyDropInterceptor:
         lands_in = float(best_drop.get("lands_in", 0.0))
         self.active_drop_id = best_drop.get("id")
 
-        # Traversal ETA to reach the 8m capture ring perimeter
-        d_to_ring = max(0.0, dist_to_drop - (self.capture_radius - 2.0))
-        traversal_eta = (d_to_ring / max(1.0, self.walk_speed)) * 1.15  # 15% terrain obstacle detour factor
+        # Traversal Kinematics (from config)
+        # Mech speed = 11.7 m/s walk, 19.5 m/s boost. Terrain detour factor = 1.15.
+        # Travel ETA = (dist_to_drop / 11.7) * 1.15
+        traversal_eta = (dist_to_drop / max(1.0, self.walk_speed)) * 1.15
+
+        # Check: Contested Ring Standoff (Vulcan Failure Mode 2 Guard)
+        # If an enemy mech is ALREADY inside the 8m capture ring:
+        # DO NOT step into the ring. Establish a 45m standoff position with line-of-sight!
+        enemy_in_ring = False
+        if visible_enemies:
+            for e in visible_enemies:
+                ep = e.get("pos", [0.0, 0.0])
+                if math.hypot(ep[0] - drop_pos[0], ep[1] - drop_pos[1]) <= self.capture_radius:
+                    enemy_in_ring = True
+                    break
+
+        if enemy_in_ring:
+            self.is_capturing = False
+            self.is_standoff = True
+            standoff_pos = self.get_standoff_position(my_pos, drop_pos, standoff_dist=45.0)
+            return standoff_pos
+
+        self.is_standoff = False
 
         # Phase A: Drop has touched down on the ground (lands_in <= 0.0) -> CAPTURE MODE
         if lands_in <= 0.0:
@@ -158,19 +247,18 @@ class SupplyDropInterceptor:
             # Otherwise, navigate directly into the 8m ring
             return drop_pos
 
-        # Phase B: Drop is descending in the air (lands_in > 0.0) -> INTERCEPTOR PATHING
-        # Trigger pathing when:
-        # 1. lands_in <= 10.0s (10 seconds before touchdown rule)
-        # OR
-        # 2. lands_in <= traversal_eta + 2.0s (timed arrival: t_arrival ≈ lands_in - 2.0s)
-        should_intercept = (lands_in <= 10.0) or (lands_in <= (traversal_eta + 2.0))
+        # Phase B: Drop is descending in the air (lands_in > 0.0) -> PREDICTIVE TOUCHDOWN ARRIVAL
+        # Start pathing toward drop beacon when:
+        # traversal_eta >= (lands_in - 2.0)
+        # This ensures we arrive at the 8m perimeter exactly 2 seconds before the crate hits the dirt.
+        should_intercept = traversal_eta >= (lands_in - 2.0)
 
         if should_intercept:
             self.is_capturing = False
             return drop_pos
 
-        # Drop is still high in the sky (> 10s away and bot is close enough to wait)
-        # Allow the bot to continue farming crates/cubes nearby instead of waiting idle
+        # Drop is still high in the sky (> 2s away from travel ETA) and bot is close enough to wait.
+        # Allow the bot to continue farming crates/cubes nearby instead of waiting idle.
         self.is_capturing = False
         return None
 
@@ -226,7 +314,7 @@ class ZoneGatekeeper:
         self.terrain = self._load_terrain()
 
         # Supply Drop Interceptor engine
-        self.drop_interceptor = SupplyDropInterceptor(walk_speed=11.7)
+        self.drop_interceptor = SupplyDropInterceptor(walk_speed=11.7, gatekeeper=self)
 
         # Stadium Bounding Box & Safe Bypasses
         # Stadium footprint: X in [-382.2, -170.2], Y in [-13.2, 266.8]
@@ -450,9 +538,9 @@ class ZoneGatekeeper:
 
         # Exact Core Rule:
         # NEVER panic-rotate 30s prematurely.
-        # Only rotate if time_to_shrink <= traversal_eta + 5.0s or is_outside.
+        # Only rotate if time_to_shrink <= traversal_eta + 4.0s or is_outside.
         time_to_shrink = shrink_start - t
-        needs_rotation = is_outside or (time_to_shrink <= (eta_seconds + 5.0))
+        needs_rotation = is_outside or (time_to_shrink <= (eta_seconds + 4.0))
 
         return bool(needs_rotation), float(eta_seconds)
 
@@ -836,18 +924,18 @@ def run_all_tests():
     }
     # Bot placed at 480m (100m outside the safe circle 380m)
     # Traversal ETA ~ 12.8s. Time to shrink = 30s.
-    # Rule: Only rotate if time_to_shrink <= traversal_eta + 5.0s (30 > 12.8 + 5.0 = 17.8) -> DO NOT PANIC!
+    # Rule: Only rotate if time_to_shrink <= traversal_eta + 4.0s (30 > 12.8 + 4.0 = 16.8) -> DO NOT PANIC!
     bot_pos = (41.3 + 480.0, -72.8)
     needs_rot_30s, eta = gk.evaluate_rotation_urgency(bot_pos, zone_test, my_speed=11.7, current_time=30.0)
     print(f"  Bot at dist 480m (safe=380m, ETA={eta:.1f}s) at t=30.0s (30s before shrink):")
     print(f"    Needs rotation? {needs_rot_30s} (Target: False — do not panic rotate 30s prematurely!)")
     assert needs_rot_30s is False, "Bot must NOT panic rotate 30s prematurely when farming is critical!"
 
-    # Now at t=45.0s (15s before shrink, time_to_shrink = 15.0s <= eta + 5.0s = 17.8s) -> MUST ROTATE NOW!
+    # Now at t=45.0s (15s before shrink, time_to_shrink = 15.0s <= eta + 4.0s = 16.8s) -> MUST ROTATE NOW!
     needs_rot_45s, _ = gk.evaluate_rotation_urgency(bot_pos, zone_test, my_speed=11.7, current_time=45.0)
-    print(f"  Same bot at t=45.0s (15s before shrink, time_left=15s <= ETA+5s=17.8s):")
+    print(f"  Same bot at t=45.0s (15s before shrink, time_left=15s <= ETA+4s=16.8s):")
     print(f"    Needs rotation? {needs_rot_45s} (Target: True — rotate on schedule!)")
-    assert needs_rot_45s is True, "Bot must trigger rotation on schedule when time_left <= eta + 5.0s!"
+    assert needs_rot_45s is True, "Bot must trigger rotation on schedule when time_left <= eta + 4.0s!"
 
     # Bot already safely inside next circle (distance 200m)
     safe_bot = (41.3 + 200.0, -72.8)
@@ -856,7 +944,7 @@ def run_all_tests():
     print(f"    Bot at distance 200m (safely inside next circle): needs_rot={needs_rot_safe} (PASS)")
 
     # -------------------------------------------------------------------------
-    # Test 3: SupplyDropInterceptor & Objective Controller
+    # Test 3: SupplyDropInterceptor & Objective Controller (Phase 2 Calibrated)
     # -------------------------------------------------------------------------
     print("\n[Test 3] SupplyDropInterceptor & Objective Controller")
     drop_test = {
@@ -867,45 +955,57 @@ def run_all_tests():
         "progress": 0,
         "holder": None
     }
-    my_bot = (120.0, 100.0)  # 20m from drop
+    my_bot = (120.0, 100.0)  # 20m from drop, traversal_eta = (20/11.7)*1.15 = 1.97s
 
     # Sub-case A: Beacon just appeared at t=70s (lands_in = 25.0s). Bot is close (20m).
+    # lands_in - 2.0 = 23.0s > traversal_eta (1.97s).
     # Expected: None (do not wait idle 25s early, continue farming).
     targ_a = evaluate_drop_objective(my_bot, [drop_test], [], 70.0)
-    print(f"  Sub-case A: lands_in=25.0s, dist=20m -> target: {targ_a} (Expected: None)")
+    print(f"  Sub-case A: lands_in=25.0s, dist=20m, ETA=1.97s -> target: {targ_a} (Expected: None)")
     assert targ_a is None, "Should not intercept 25s early when close"
 
-    # Sub-case B: Drop descending at 9.0s before touchdown (lands_in = 9.0s <= 10.0s rule).
-    # Expected: path toward landing coordinate (100.0, 100.0) to arrive ~2s before touchdown.
-    drop_test["lands_in"] = 9.0
-    targ_b = evaluate_drop_objective(my_bot, [drop_test], [], 86.0)
-    print(f"  Sub-case B: lands_in=9.0s <= 10s rule -> target: {targ_b} (Expected: (100.0, 100.0))")
-    assert targ_b == (100.0, 100.0), "Should path toward landing coordinate 10s before touchdown!"
+    # Sub-case B: Predictive Touchdown Arrival:
+    # Bot is at 100m away, traversal_eta = (100 / 11.7) * 1.15 = 9.83s.
+    # When lands_in = 11.0s, lands_in - 2.0 = 9.0s <= traversal_eta (9.83s).
+    # Expected: start pathing toward drop beacon!
+    far_bot_100m = (200.0, 100.0)
+    drop_test["lands_in"] = 11.0
+    targ_b = evaluate_drop_objective(far_bot_100m, [drop_test], [], 84.0)
+    print(f"  Sub-case B (Predictive Touchdown): lands_in=11.0s, dist=100m, ETA=9.83s >= lands_in-2.0 (9.0s) -> target: {targ_b}")
+    assert targ_b == (100.0, 100.0), "Should path toward landing coordinate when traversal_eta >= lands_in - 2.0!"
 
-    # Sub-case C: Drop is far (180m away), lands_in = 18.0s (t_travel ~ 17s).
-    # Expected: path toward landing coordinate early so t_arrival ≈ lands_in - 2.0s.
-    drop_test["lands_in"] = 18.0
-    far_bot = (280.0, 100.0)
-    targ_c = evaluate_drop_objective(far_bot, [drop_test], [], 77.0)
-    print(f"  Sub-case C: lands_in=18.0s, dist=180m -> target: {targ_c} (Expected: (100.0, 100.0))")
-    assert targ_c == (100.0, 100.0), "Should path early when far to achieve timed arrival!"
-
-    # Sub-case D: Drop has landed (lands_in = 0.0s), bot is outside the 8m ring (15m away).
+    # Sub-case C: Drop has landed (lands_in = 0.0s), bot is outside the 8m ring (15m away).
     drop_test["lands_in"] = 0.0
-    targ_d = evaluate_drop_objective((115.0, 100.0), [drop_test], [], 95.0)
-    print(f"  Sub-case D: lands_in=0.0s, dist=15m -> target: {targ_d} (Expected: (100.0, 100.0))")
-    assert targ_d == (100.0, 100.0), "Should navigate into 8m capture ring"
+    targ_c = evaluate_drop_objective((115.0, 100.0), [drop_test], [], 95.0)
+    print(f"  Sub-case C: lands_in=0.0s, dist=15m -> target: {targ_c} (Expected: (100.0, 100.0))")
+    assert targ_c == (100.0, 100.0), "Should navigate into 8m capture ring"
 
-    # Sub-case E: Drop has landed (lands_in = 0.0s), bot is inside 8m ring (4m away).
+    # Sub-case D: Drop has landed (lands_in = 0.0s), bot is inside 8m ring (4m away).
     # Expected: hold within 8.0m capture radius for 4.0s!
     inside_bot = (104.0, 100.0)
-    targ_e = evaluate_drop_objective(inside_bot, [drop_test], [], 96.0)
-    print(f"  Sub-case E: lands_in=0.0s, inside ring (dist=4m) -> target: {targ_e} (Hold ring)")
-    assert targ_e == inside_bot, "Should hold within 8.0m capture radius for 4.0s!"
+    targ_d = evaluate_drop_objective(inside_bot, [drop_test], [], 96.0)
+    print(f"  Sub-case D: lands_in=0.0s, inside ring (dist=4m) -> target: {targ_d} (Hold ring)")
+    assert targ_d == inside_bot, "Should hold within 8.0m capture radius for 4.0s!"
 
-    # Defensive aim while capturing
-    aim_yaw, _ = gk.get_drop_defensive_aim(inside_bot, drop_test, [])
-    print(f"    Defensive approach crosshair yaw: {math.degrees(aim_yaw):.1f}° (PASS)")
+    # Sub-case E: Contested Ring Standoff (Vulcan Failure Mode 2 Guard):
+    # If an enemy mech is ALREADY inside the 8m capture ring:
+    # DO NOT step into the ring (avoid the sitting duck killzone).
+    # Instead, establish a 45m standoff position with line-of-sight and shoot the stationary capturing enemy!
+    enemy_in_ring = {"id": 99, "pos": [102.0, 100.0, 0.0], "hp": 1400.0}
+    targ_standoff = evaluate_drop_objective(my_bot, [drop_test], [enemy_in_ring], 96.0)
+    dist_standoff = math.hypot(targ_standoff[0] - 100.0, targ_standoff[1] - 100.0)
+    print(f"  Sub-case E (Contested Ring Standoff): Enemy in 8m ring -> target: {targ_standoff}, dist_to_drop={dist_standoff:.1f}m")
+    assert targ_standoff != (100.0, 100.0), "Must NOT step into the contested 8m ring!"
+    assert dist_standoff > 8.0, "Standoff position must be outside the 8.0m killzone!"
+    assert 40.0 <= dist_standoff <= 50.0, f"Standoff position must establish ~45m distance (actual: {dist_standoff:.1f}m)!"
+    assert gk.has_los(targ_standoff[0], targ_standoff[1], 100.0, 100.0), "Standoff position must have clear line-of-sight to drop!"
+
+    # Defensive aim while at standoff aiming at enemy in ring
+    aim_yaw, _ = gk.get_drop_defensive_aim(targ_standoff, drop_test, [enemy_in_ring])
+    enemy_yaw = math.atan2(enemy_in_ring["pos"][1] - targ_standoff[1], enemy_in_ring["pos"][0] - targ_standoff[0])
+    dev = abs(math.atan2(math.sin(aim_yaw - enemy_yaw), math.cos(aim_yaw - enemy_yaw)))
+    print(f"    Defensive aim directly at capturing enemy: dev={math.degrees(dev):.2f}° (PASS)")
+    assert math.degrees(dev) < 0.1, "Defensive aim must lock onto capturing enemy in the ring!"
 
     # -------------------------------------------------------------------------
     # Test 4: Ohio Stadium Pinch Avoidance & Safe Bypass

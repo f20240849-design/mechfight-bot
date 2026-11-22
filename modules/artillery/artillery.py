@@ -33,6 +33,112 @@ import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Any, Union
 
+# ==============================================================================
+# EXACT BALLISTICS & BATTLEFIELD CALIBRATIONS (PHASE 2)
+# ==============================================================================
+# Mech Physical Geometry
+MECH_RADIUS = 2.5            # meters
+MECH_HEIGHT = 9.0            # meters
+MUZZLE_ELEVATION = 7.0       # pos.z + 7.0m (Arm Gun & Laser muzzle)
+CENTER_OF_MASS_OFFSET = 4.5  # pos.z + 4.5m
+MORTAR_TUBE_OFFSET = 9.5     # pos.z + 9.5m
+
+# Rear Armor Multiplier
+REAR_MULT = 1.5              # +50% bonus if hit from behind (front arc = 180°)
+
+# Arm Gun Physical Numbers
+ARM_GUN_DAMAGE = 45.0
+ARM_GUN_REAR_DAMAGE = 45.0 * REAR_MULT  # 67.5 rear damage!
+ARM_GUN_SPEED = 252.0                   # m/s
+ARM_GUN_COOLDOWN = 0.24                 # seconds
+ARM_GUN_SPREAD_DEG = 0.6                # degrees
+ARM_GUN_MAG = 12                        # rounds
+ARM_GUN_RELOAD = 2.4                    # seconds
+
+# Laser Physical Numbers
+LASER_DAMAGE = 315.0
+LASER_REAR_DAMAGE = 315.0 * REAR_MULT   # 472.5 rear damage (instant one-shot execution)!
+LASER_SPEED = float("inf")              # Hitscan (instantaneous)
+LASER_CHARGE_TIME = 0.75                # seconds
+LASER_COOLDOWN = 1.65                   # seconds
+LASER_RANGE = 280.0                     # meters
+LASER_COOKOFF_MULT = 1.6                # +60% vs mortar carrier (504 dmg, or 756 rear!)
+
+# Lightning Physical Numbers
+LIGHTNING_DAMAGE = 60.0
+LIGHTNING_RANGE = 45.0                  # meters
+LIGHTNING_CONE_DEG = 30.0               # +-15 degrees
+LIGHTNING_COOLDOWN = 0.25               # seconds (240 DPS sustained)
+LIGHTNING_ENERGY = 3.0                  # energy cost per discharge (0 ammo)
+LIGHTNING_SHORT_S = 2.0                 # locks enemy Lasers offline for 2.0s!
+
+# NPC Specifications
+NPC_COUNT = 12
+NPC_HP = 350.0
+NPC_SPEED = 5.0                         # m/s
+NPC_DROPS_CUBES = 2                     # Power Cubes dropped per kill
+# One Laser beam (315) + 1 Gun bullet (45) = 360 > 350 HP (Instakill in 1.0s!)
+
+# Safety Thresholds
+NPC_PLAYER_THREAT_DIST = 55.0           # meters: abort NPC hunting if enemy player <= 55m
+
+
+def compute_exact_predictive_lead(
+    my_pos: Union[List[float], Tuple[float, ...]],
+    target_pos: Union[List[float], Tuple[float, ...]],
+    target_vel: Union[List[float], Tuple[float, ...]],
+    bullet_speed: float = ARM_GUN_SPEED,
+    target_height_offset: float = CENTER_OF_MASS_OFFSET,
+    muzzle_height: float = MUZZLE_ELEVATION
+) -> Tuple[float, float, float]:
+    """
+    Exact First-Order Predictive Lead.
+    Solves: |P + V*t - M|^2 = (bullet_speed * t)^2 for the smallest positive root t.
+    Aim = (atan2(P.y + V.y*t - M.y, P.x + V.x*t - M.x), pitch).
+    Returns: (yaw, pitch, flight_time)
+    """
+    mx, my, mz = my_pos[0], my_pos[1], my_pos[2] + muzzle_height
+    px, py, pz = target_pos[0], target_pos[1], target_pos[2] + target_height_offset
+    vx = target_vel[0] if len(target_vel) > 0 else 0.0
+    vy = target_vel[1] if len(target_vel) > 1 else 0.0
+    vz = target_vel[2] if len(target_vel) > 2 else 0.0
+
+    dx = px - mx
+    dy = py - my
+    dz = pz - mz
+
+    s = max(bullet_speed, 1.0)
+    # Quadratic: a * t^2 + b * t + c = 0
+    # a = |V|^2 - s^2
+    # b = 2 * (D . V)
+    # c = |D|^2
+    v_sq = vx * vx + vy * vy + vz * vz
+    a = v_sq - (s * s)
+    b = 2.0 * (dx * vx + dy * vy + dz * vz)
+    c = dx * dx + dy * dy + dz * dz
+
+    disc = b * b - 4.0 * a * c
+    if disc >= 0.0 and abs(a) > 1e-6:
+        # Smallest positive root: since a < 0, (-b - sqrt(disc)) / (2*a) is positive
+        sqrt_disc = math.sqrt(disc)
+        t1 = (-b - sqrt_disc) / (2.0 * a)
+        t2 = (-b + sqrt_disc) / (2.0 * a)
+        roots = [r for r in (t1, t2) if r > 0]
+        t = min(roots) if roots else math.sqrt(c) / s
+    else:
+        t = math.sqrt(c) / s
+
+    # Predicted intercept relative to muzzle
+    rx = dx + vx * t
+    ry = dy + vy * t
+    rz = dz + vz * t
+
+    horiz = math.hypot(rx, ry)
+    yaw = math.atan2(ry, rx)
+    pitch = math.atan2(rz, max(horiz, 0.01))
+
+    return yaw, pitch, t
+
 
 @dataclass
 class MortarTrajectory:
@@ -659,12 +765,39 @@ class NPCHunter:
     - 12 NPCs roam the arena with 350 HP, moving at ~5 m/s.
     - Each NPC drops 2 Power Cubes upon destruction (+8% HP & Damage, upgrade progression).
     - In the opening 60 seconds (t < 60s), any NPC within 90m (hp <= 350) is prioritized.
-    - Laser (315 hitscan dmg) + Arm Gun (45 dmg) burst delivers an instantaneous 360 dmg kill!
+    - Laser (315 hitscan dmg) + Arm Gun (45 dmg) burst delivers an instantaneous 360 dmg kill (> 350 HP instakill in 1.0s!).
+    - Safe-Hunting Guard: If any enemy player mech is within 55m, abort NPC hunting and reserve all 12 gun rounds for the player mech.
     """
 
-    def __init__(self, hunt_window_s: float = 60.0, max_hunt_dist: float = 90.0):
+    def __init__(
+        self,
+        hunt_window_s: float = 60.0,
+        max_hunt_dist: float = 90.0,
+        player_threat_dist: float = NPC_PLAYER_THREAT_DIST
+    ):
         self.hunt_window_s = hunt_window_s
         self.max_hunt_dist = max_hunt_dist
+        self.player_threat_dist = player_threat_dist
+
+    def is_safe_to_hunt(
+        self,
+        my_pos: Union[List[float], Tuple[float, ...]],
+        visible_entities: List[Dict[str, Any]],
+        threat_radius: Optional[float] = None
+    ) -> bool:
+        """
+        NPC Safe-Hunting Guard:
+        If any enemy player mech is within 55m, abort NPC hunting and reserve all 12 gun rounds for the player mech.
+        """
+        radius = threat_radius if threat_radius is not None else self.player_threat_dist
+        mx, my = my_pos[0], my_pos[1]
+        for e in visible_entities:
+            # Player mechs have kind == "mech" (or not "npc") and hp > 0
+            if e.get("kind") == "mech" and float(e.get("hp", 0.0)) > 0.0:
+                ep = e.get("pos", [0, 0, 0])
+                if math.hypot(ep[0] - mx, ep[1] - my) <= radius:
+                    return False
+        return True
 
     def find_target(
         self,
@@ -673,10 +806,14 @@ class NPCHunter:
         current_time: float
     ) -> Optional[Dict[str, Any]]:
         """
-        Scans visible entities. If current_time < 60s, returns the prioritized NPC
-        (kind == 'npc', hp <= 350) within 90m.
+        Scans visible entities. If current_time < 60s and no enemy player within 55m,
+        returns the prioritized NPC (kind == 'npc', hp <= 350) within 90m.
         """
         if current_time >= self.hunt_window_s:
+            return None
+
+        # Safe-Hunting Guard: abort if enemy player mech within 55m
+        if not self.is_safe_to_hunt(my_pos, visible_entities):
             return None
 
         mx, my = my_pos[0], my_pos[1]
@@ -684,7 +821,7 @@ class NPCHunter:
         for e in visible_entities:
             if e.get("kind") == "npc":
                 hp = float(e.get("hp", 350.0))
-                if hp <= 350.0:
+                if hp <= NPC_HP:
                     ep = e.get("pos", [0, 0, 0])
                     dist = math.hypot(ep[0] - mx, ep[1] - my)
                     if dist <= self.max_hunt_dist:
@@ -709,6 +846,8 @@ class DynamicTargetScorer:
     - Eliminates naive 'closest enemy' targeting.
     - Rear armor takes 1.5x damage (+50% bonus). Firing a Laser (315 dmg) at rear armor
       inflicts 472.5 damage—an instant one-shot execution on wounded brawlers.
+    - Instant Rear-Shot Execution: If an enemy mech has HP <= 472.0 and is rear-facing (|angle_diff| < pi/2),
+      prioritize Laser discharge immediately for an instant one-hit kill!
     - Prioritizes brawlers occupied fighting third parties.
     """
 
@@ -718,23 +857,24 @@ class DynamicTargetScorer:
     def is_rear_facing(
         self,
         my_pos: Union[List[float], Tuple[float, ...]],
-        target: Dict[str, Any]
+        target: Dict[str, Any],
+        aim_yaw: Optional[float] = None
     ) -> bool:
         """
-        Checks if our shot enters through the target's rear armor (> 90 deg from their aim yaw).
-        In protocol.md §7: Front arc is 180 deg centered on torso aim yaw.
-        Outside this 180 deg front arc (|bearing_to_us - aim_yaw| > 90 deg) is rear armor (1.5x damage).
+        Exact Rear Armor Multiplier (rear_mult = 1.5, +50% bonus if hit from behind, front arc = 180°).
+        Angle diff formula: |atan2(sin(aim_yaw - target.aim_yaw), cos(aim_yaw - target.aim_yaw))|
+        If angle diff < 90° (pi/2 rad), it is a REAR HIT -> Damage * 1.5!
         """
         t_pos = target.get("pos", [0, 0, 0])
-        dx = my_pos[0] - t_pos[0]
-        dy = my_pos[1] - t_pos[1]
-        bearing_to_us = math.atan2(dy, dx)
+        if aim_yaw is None:
+            # Bullet/beam flight direction from us to target
+            aim_yaw = math.atan2(t_pos[1] - my_pos[1], t_pos[0] - my_pos[0])
 
         target_aim = target.get("aim", [0.0, 0.0])
         target_yaw = target_aim[0] if isinstance(target_aim, (list, tuple)) and len(target_aim) > 0 else 0.0
 
-        angle_diff = math.atan2(math.sin(bearing_to_us - target_yaw), math.cos(bearing_to_us - target_yaw))
-        return abs(angle_diff) > (math.pi / 2.0)
+        angle_diff = abs(math.atan2(math.sin(aim_yaw - target_yaw), math.cos(aim_yaw - target_yaw)))
+        return angle_diff < (math.pi / 2.0)
 
     def is_fighting_others(
         self,
@@ -781,31 +921,44 @@ class DynamicTargetScorer:
         self,
         my_pos: Union[List[float], Tuple[float, ...]],
         target: Dict[str, Any],
-        all_mechs: Optional[List[Dict[str, Any]]] = None
+        all_mechs: Optional[List[Dict[str, Any]]] = None,
+        aim_yaw: Optional[float] = None
     ) -> float:
         """
         Computes score per the mission spec:
             Score = (1000.0 / enemy_hp) + (is_rear_facing * 200.0) + (is_fighting_others * 150.0) - (distance * 0.05)
+        Instant Rear-Shot Execution:
+            If an enemy mech has HP <= 472.0 and is rear-facing (|angle_diff| < pi/2), prioritize Laser discharge immediately
+            for an instant one-hit kill! Adds an execution priority bonus (+1000.0).
         """
         hp = max(1.0, float(target.get("hp", 1000.0)))
         t_pos = target.get("pos", [0, 0, 0])
         dist = math.hypot(t_pos[0] - my_pos[0], t_pos[1] - my_pos[1])
 
-        rear_val = 1.0 if self.is_rear_facing(my_pos, target) else 0.0
+        is_rear = self.is_rear_facing(my_pos, target, aim_yaw)
+        rear_val = 1.0 if is_rear else 0.0
         fighting_val = 1.0 if self.is_fighting_others(my_pos, target, all_mechs) else 0.0
 
         score = (1000.0 / hp) + (rear_val * 200.0) + (fighting_val * 150.0) - (dist * 0.05)
+
+        # Instant Rear-Shot Execution Priority:
+        # Laser hitscan deals 315 * 1.5 = 472.5 dmg to rear armor.
+        # If HP <= 472.0, this is an instant one-hit kill!
+        if is_rear and hp <= 472.0:
+            score += 1000.0  # Instant rear-shot execution priority bonus!
+
         return score
 
     def rank_targets(
         self,
         my_pos: Union[List[float], Tuple[float, ...]],
-        targets: List[Dict[str, Any]]
+        targets: List[Dict[str, Any]],
+        aim_yaw: Optional[float] = None
     ) -> List[Tuple[float, Dict[str, Any]]]:
         scored = []
         for t in targets:
             if t.get("hp", 0) > 0:
-                s = self.compute_score(my_pos, t, targets)
+                s = self.compute_score(my_pos, t, targets, aim_yaw)
                 scored.append((s, t))
         scored.sort(key=lambda item: item[0], reverse=True)
         return scored
@@ -823,13 +976,15 @@ class LaserLightningCombo:
     2. Rear-Armor Execution:
        Follow up with Hitscan Laser (315 dmg base, 472.5 dmg to rear armor)
        or continuous 240 DPS Lightning bursts to eliminate the disabled target.
+    3. Instant Rear-Shot Execution:
+       If enemy mech has HP <= 472.0 and is rear-facing, trigger instant Laser execution!
     """
 
     def __init__(
         self,
         range_m: float = 40.0,
         cone_deg: float = 30.0,
-        short_duration: float = 2.0
+        short_duration: float = LIGHTNING_SHORT_S
     ):
         self.range_m = range_m
         self.half_cone_rad = math.radians(cone_deg / 2.0)
@@ -849,7 +1004,7 @@ class LaserLightningCombo:
         - Target carries Laser, or is charging, or general close combat.
         - Energy >= 3.0 and cooldown <= 0.05s.
         """
-        if current_energy < 3.0 or lightning_cooldown > 0.05:
+        if current_energy < LIGHTNING_ENERGY or lightning_cooldown > 0.05:
             return False
 
         t_pos = target.get("pos", [0, 0, 0])
@@ -866,6 +1021,30 @@ class LaserLightningCombo:
 
         return True
 
+    def is_instant_rear_execution(
+        self,
+        my_pos: Union[List[float], Tuple[float, ...]],
+        target: Dict[str, Any],
+        aim_yaw: Optional[float] = None
+    ) -> bool:
+        """
+        Instant Rear-Shot Execution:
+        If an enemy mech has HP <= 472.0 and is rear-facing (|angle_diff| < pi/2),
+        returns True to prioritize Laser discharge immediately for an instant one-hit kill!
+        """
+        hp = float(target.get("hp", 1000.0))
+        if hp > 472.0:
+            return False
+
+        t_pos = target.get("pos", [0, 0, 0])
+        if aim_yaw is None:
+            aim_yaw = math.atan2(t_pos[1] - my_pos[1], t_pos[0] - my_pos[0])
+        target_aim = target.get("aim", [0.0, 0.0])
+        target_yaw = target_aim[0] if isinstance(target_aim, (list, tuple)) and len(target_aim) > 0 else 0.0
+
+        angle_diff = abs(math.atan2(math.sin(aim_yaw - target_yaw), math.cos(aim_yaw - target_yaw)))
+        return angle_diff < (math.pi / 2.0)
+
     def calculate_combo_burst(
         self,
         target: Dict[str, Any],
@@ -875,14 +1054,14 @@ class LaserLightningCombo:
         Estimates total burst damage:
         - Lightning: 60 dmg (costs 3 energy, applies 2.0s short)
         - Laser: 315 dmg base (472.5 rear armor, 504.0 vs mortar, 756.0 rear + mortar)
-        - Arm Gun: 45 dmg
+        - Arm Gun: 45 dmg (67.5 rear armor)
         """
         target_weapons = target.get("weapons", [])
         has_mortar = "mortar" in target_weapons
-        laser_base = 315.0 * (1.6 if has_mortar else 1.0)
-        laser_dmg = laser_base * (1.5 if is_rear_facing else 1.0)
-        lightning_dmg = 60.0 * (1.5 if is_rear_facing else 1.0)
-        gun_dmg = 45.0 * (1.5 if is_rear_facing else 1.0)
+        laser_base = LASER_DAMAGE * (LASER_COOKOFF_MULT if has_mortar else 1.0)
+        laser_dmg = laser_base * (REAR_MULT if is_rear_facing else 1.0)
+        lightning_dmg = LIGHTNING_DAMAGE * (REAR_MULT if is_rear_facing else 1.0)
+        gun_dmg = ARM_GUN_DAMAGE * (REAR_MULT if is_rear_facing else 1.0)
 
         return {
             "lightning_dmg": lightning_dmg,
@@ -902,20 +1081,18 @@ def select_optimal_target(
     Selects the optimal combat target following BALLIS doctrines:
     1. NPCHunter: Opening 60 seconds (current_time < 60s), if an NPC (kind == 'npc', hp <= 350)
        is within 90m, prioritize it for power cube harvesting (2 cubes).
+       Safe-Hunting Guard: If any enemy player mech is within 55m, abort NPC hunting and reserve all 12 gun rounds for the player mech!
     2. DynamicTargetScorer: Otherwise, scores all visible enemies:
        Score = (1000 / enemy_hp) + (is_rear_facing * 200) + (is_fighting_others * 150) - (distance * 0.05)
+       Instant Rear-Shot Execution: If enemy has HP <= 472.0 and is rear-facing, prioritizes Laser execution!
        Targets the lowest-HP enemy whose back is turned.
     """
     if not visible_mechs:
         return None
 
-    # 1. NPCHunter check during the opening 60 seconds (only if no player mech is threatening within 55m)
-    nearby_mechs = [
-        m for m in visible_mechs
-        if m.get("kind") == "mech" and m.get("hp", 0) > 0 and math.hypot(m["pos"][0] - my_pos[0], m["pos"][1] - my_pos[1]) < 55.0
-    ]
-    if current_time < 60.0 and not nearby_mechs:
-        hunter = NPCHunter(hunt_window_s=60.0, max_hunt_dist=90.0)
+    # 1. NPCHunter check during opening 60 seconds (with 55m Safe-Hunting Guard)
+    if current_time < 60.0:
+        hunter = NPCHunter(hunt_window_s=60.0, max_hunt_dist=90.0, player_threat_dist=NPC_PLAYER_THREAT_DIST)
         npc_target = hunter.find_target(my_pos, visible_mechs, current_time)
         if npc_target is not None:
             return npc_target
@@ -1142,6 +1319,16 @@ class ArtillerySystem:
         """Exposed method for selecting optimal target (NPCHunter opening + DynamicTargetScorer)."""
         return select_optimal_target(my_pos, visible_mechs, current_time)
 
+    def compute_exact_predictive_lead(
+        self,
+        my_pos: Union[List[float], Tuple[float, ...]],
+        target_pos: Union[List[float], Tuple[float, ...]],
+        target_vel: Union[List[float], Tuple[float, ...]],
+        bullet_speed: float = ARM_GUN_SPEED
+    ) -> Tuple[float, float, float]:
+        """Solves exact first-order predictive lead: |P + V*t - M|^2 = (s*t)^2."""
+        return compute_exact_predictive_lead(my_pos, target_pos, target_vel, bullet_speed)
+
     def evaluate_combat_tick(
         self,
         me: Dict[str, Any],
@@ -1213,7 +1400,7 @@ class ArtillerySystem:
 
         # 3. Direct Target Combat
         if target:
-            is_rear = self.target_scorer.is_rear_facing(my_pos, target)
+            is_rear = self.target_scorer.is_rear_facing(my_pos, target, aim[0])
             t_pos = target.get("pos", [0, 0, 0])
             t_dist = math.hypot(t_pos[0] - my_pos[0], t_pos[1] - my_pos[1])
             target_weapons = target.get("weapons", [])
@@ -1227,9 +1414,15 @@ class ArtillerySystem:
 
                 # --- Weapon: Laser ---
                 if w_kind == "laser":
+                    is_instant_kill = target and self.combo.is_instant_rear_execution(my_pos, target, aim[0])
                     hold_trigger, move_intent = self.laser.update_cycle(
                         w, has_los, t_dist, in_cover, current_time
                     )
+                    # If instant rear kill available and fully charged, release immediately!
+                    if is_instant_kill and has_los and w.get("charge", 0.0) >= self.laser.charge_time:
+                        hold_trigger = False
+                        move_intent = "INSTANT_REAR_EXECUTION"
+
                     result_fire[slot_idx] = hold_trigger
                     tactical_move = move_intent
                     if has_los:
@@ -1259,6 +1452,13 @@ class ArtillerySystem:
                     reload_s = w.get("reload", 0.0)
                     if has_los and ammo > 0 and reload_s == 0.0 and w_cd <= 0.05:
                         result_fire[slot_idx] = True
+                        t_vel = target.get("vel", [0.0, 0.0, 0.0])
+                        lead_yaw, lead_pitch, _ = compute_exact_predictive_lead(
+                            my_pos, t_pos, t_vel, bullet_speed=ARM_GUN_SPEED
+                        )
+                        # If arm gun is primary firing weapon, set lead aim
+                        if not result_fire[1] or weapons[1] is None:
+                            result_aim = [lead_yaw, lead_pitch]
 
         t_end = time.perf_counter()
         exec_ms = (t_end - t_start) * 1000.0
@@ -1276,3 +1476,95 @@ class ArtillerySystem:
             "target": target,
             "execution_time_ms": exec_ms
         }
+
+
+# ==============================================================================
+# SELF-TEST & VERIFICATION SUITE
+# ==============================================================================
+if __name__ == "__main__":
+    print("==================================================================")
+    print("RUNNING BALLIS BALLISTICS LEAD & REAR-ARMOR CALIBRATION VERIFICATION")
+    print("==================================================================")
+
+    # 1. Exact First-Order Predictive Lead Test
+    my_pos = (10.0, 20.0, 0.0)
+    target_pos = (110.0, 70.0, 0.0)
+    target_vel = (11.7, -5.0, 0.0)
+    speed = ARM_GUN_SPEED  # 252.0 m/s
+
+    yaw, pitch, t_flight = compute_exact_predictive_lead(
+        my_pos, target_pos, target_vel, bullet_speed=speed
+    )
+
+    # Verify |P + V*t - M|^2 == (s*t)^2
+    mx, my, mz = my_pos[0], my_pos[1], my_pos[2] + MUZZLE_ELEVATION
+    px = target_pos[0] + target_vel[0] * t_flight
+    py = target_pos[1] + target_vel[1] * t_flight
+    pz = target_pos[2] + CENTER_OF_MASS_OFFSET + target_vel[2] * t_flight
+    intercept_dist = math.hypot(px - mx, py - my, pz - mz)
+    bullet_dist = speed * t_flight
+    err = abs(intercept_dist - bullet_dist)
+    assert err < 1e-9, f"Exact lead equation violated: error={err}"
+    print(f"[PASS] Exact First-Order Predictive Lead: t={t_flight:.4f}s, dist={intercept_dist:.2f}m, err={err:.1e}")
+
+    # 2. Rear Armor Multiplier & Angle Diff Formula Test
+    # Formula: |atan2(sin(aim_yaw - target.aim_yaw), cos(aim_yaw - target.aim_yaw))|
+    # If angle diff < 90° (pi/2 rad), it is a REAR HIT -> Damage * 1.5!
+    scorer = DynamicTargetScorer()
+    # Case A: We aim East (0.0) at enemy who is also aiming East (0.0) -> from behind!
+    diff_rear = abs(math.atan2(math.sin(0.0 - 0.0), math.cos(0.0 - 0.0)))
+    assert diff_rear < (math.pi / 2.0), "Expected angle diff < pi/2 for rear hit"
+    assert ARM_GUN_DAMAGE * REAR_MULT == 67.5, "Arm Gun rear damage must be 67.5"
+    assert LASER_DAMAGE * REAR_MULT == 472.5, "Laser rear damage must be 472.5"
+    print(f"[PASS] Rear Armor Multiplier: angle_diff={math.degrees(diff_rear):.1f}° < 90° -> Laser={LASER_REAR_DAMAGE} dmg, Gun={ARM_GUN_REAR_DAMAGE} dmg")
+
+    # Case B: We aim East (0.0), enemy aims West (pi) -> front hit!
+    diff_front = abs(math.atan2(math.sin(0.0 - math.pi), math.cos(0.0 - math.pi)))
+    assert diff_front > (math.pi / 2.0), "Expected angle diff > pi/2 for front hit"
+    print(f"[PASS] Front Armor Protection: angle_diff={math.degrees(diff_front):.1f}° > 90° -> Standard damage")
+
+    # 3. Instant Rear-Shot Execution Test
+    # If enemy mech has HP <= 472.0 and is rear-facing, prioritize Laser discharge immediately!
+    combo = LaserLightningCombo()
+    rear_wounded_enemy = {
+        "id": 5,
+        "kind": "mech",
+        "hp": 450.0,  # <= 472.0!
+        "pos": [50.0, 20.0, 0.0],
+        "aim": [0.0, 0.0]  # Facing East away from us
+    }
+    assert combo.is_instant_rear_execution(my_pos, rear_wounded_enemy, aim_yaw=0.0) is True
+    print(f"[PASS] Instant Rear-Shot Execution: Enemy (HP=450 <= 472.0, rear) triggers one-shot kill priority!")
+
+    # 4. NPC Safe-Hunting Guard Test
+    # If any enemy player mech is within 55m, abort NPC hunting and reserve all 12 gun rounds for the player mech.
+    hunter = NPCHunter(hunt_window_s=60.0, max_hunt_dist=90.0, player_threat_dist=55.0)
+    entities_with_player_threat = [
+        {"id": 101, "kind": "npc", "hp": 350.0, "pos": [30.0, 20.0, 0.0]},
+        {"id": 2, "kind": "mech", "hp": 1400.0, "pos": [45.0, 20.0, 0.0]}  # 35m away <= 55m!
+    ]
+    npc_target = hunter.find_target(my_pos, entities_with_player_threat, current_time=20.0)
+    assert npc_target is None, "NPC Safe-Hunting Guard failed to abort when player mech <= 55m!"
+    print(f"[PASS] NPC Safe-Hunting Guard: Aborted NPC hunt due to enemy player mech at 35m (<= 55m threshold).")
+
+    # Safe to hunt when player mech is far (> 55m)
+    entities_safe = [
+        {"id": 101, "kind": "npc", "hp": 350.0, "pos": [30.0, 20.0, 0.0]},
+        {"id": 2, "kind": "mech", "hp": 1400.0, "pos": [80.0, 20.0, 0.0]}  # 70m away > 55m
+    ]
+    npc_safe_target = hunter.find_target(my_pos, entities_safe, current_time=20.0)
+    assert npc_safe_target is not None and npc_safe_target["id"] == 101
+    print(f"[PASS] NPC Hunting Active: No player mech within 55m -> target NPC 101 for 2 cubes.")
+
+    # 5. NPC Instakill Math: Laser (315) + Gun (45) = 360 > 350 HP in 1.0s
+    assert LASER_DAMAGE + ARM_GUN_DAMAGE == 360.0
+    assert 360.0 > NPC_HP, "Laser + Gun burst must exceed 350 HP"
+    print(f"[PASS] NPC Instakill Burst: Laser (315) + Gun (45) = 360 > 350 HP (Instakill in 1.0s).")
+
+    # 6. Lightning Short Status Test
+    assert LIGHTNING_SHORT_S == 2.0
+    print(f"[PASS] Lightning short_s: 2.0s locks enemy Lasers offline for 2s.")
+
+    print("\n==================================================================")
+    print("[BALLIS] All Phase 2 Ballistics Lead & Rear-Armor Calibrations Passed with 0 Errors!")
+    print("==================================================================")

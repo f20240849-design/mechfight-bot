@@ -9,19 +9,24 @@ The center becomes an immediate 15-bot crossfire slaughterhouse. Walking toward 
 or panic-escaping to rooftops causes premature elimination. Rooftop parkour is deprecated
 for combat escape.
 
-The Solution: FlankOrbitEngine
-Calculates a tangential orbital movement path that:
-1. Maintains our bot at a safe distance on the outer perimeter:
-   r = 0.72 to 0.82 * next_radius from next_center (nominal target = 0.77 * next_radius).
-2. Never enters the inner 45% radius of the zone circle until Phase 5 (< 5 mechs alive).
+Phase 2 Kinematics & Physical Calibration:
+1. Exact Orbital Band:
+   Target orbit radius strictly enforced at r_orbit = 0.75 * zone.next_radius,
+   clamped to stay at least 25m inside zone.radius to avoid gas clipping.
+2. Energy Conservation Guard:
+   When pulsing boost for orbital repositioning, never let energy drop below 35.0
+   (preserving energy for emergency transverse strafing).
+3. Ohio Stadium Exclusion:
+   Ohio Stadium footprint: x in [-320, -180], y in [-60, 260].
+   If the orbital waypoint falls within 15m of the stadium footprint, biases the
+   tangential vector toward the concourse bypass corridors (-220, -28) or (-220, 285).
+4. Strict Inner 45% Exclusion:
+   Never enters the inner 45% radius of next_center until Phase 5 (< 5 mechs alive).
    Enforces an emergency radial escape outward if spawning or pushed inside r < 0.45 * R.
-3. Tangentially orbits around the circle boundary using terrain and building cover,
-   steering around solid obstacles while utilizing building walls for LOS protection.
-4. Smoothly navigates away from the centroid of active sound clusters (the center brawl),
-   dynamically selecting the orbital direction (CW vs CCW) that maximizes distance from
-   the active crossfire.
-5. High-Performance Execution: Pure Python + NumPy with sub-0.01 ms execution latency
-   (well within the 0.5 ms computational budget).
+5. Sound Cluster Repulsion:
+   Smoothly deflects away from the centroid of active sound clusters (center brawl).
+6. Sub-millisecond Execution:
+   Pure Python + NumPy execution latency < 0.02 ms (well within 0.5 ms limit).
 """
 
 from __future__ import annotations
@@ -36,12 +41,46 @@ import numpy as np
 
 
 # =====================================================================
-# Constants & Geometric Parameters
+# Engine & Physical Constants (MechRoyale / mechfight/1)
 # =====================================================================
 
-ORBIT_MIN_RATIO = 0.72         # Inner perimeter boundary (0.72 * next_radius)
-ORBIT_MAX_RATIO = 0.82         # Outer perimeter boundary (0.82 * next_radius)
-ORBIT_TARGET_RATIO = 0.77      # Nominal sweet-spot orbit radius (0.77 * next_radius)
+# Mech Dimensions
+MECH_RADIUS = 2.5              # Collision hit radius (m)
+MECH_HEIGHT = 9.0              # Total mech height (m)
+
+# Movement Speeds
+WALK_SPEED = 11.7              # Ground walk speed (m/s)
+BOOST_SPEED = 19.5             # Boost speed (m/s)
+
+# Energy System
+MAX_ENERGY = 100.0             # Energy tank capacity
+ENERGY_REGEN = 18.0            # Energy regen rate (units/s)
+ENERGY_REGEN_DELAY = 0.6       # Delay before regen starts (s)
+BOOST_DRAIN = 17.0             # Boost energy consumption (units/s)
+JET_DRAIN = 15.0               # Jump jet consumption (units/s)
+ENERGY_GUARD_THRESHOLD = 35.0  # Reserve energy floor for emergency strafing
+
+# Safe Zone Dimensions & Phases
+ZONE_START_RADIUS = 560.0
+ZONE_PHASE_1_RADIUS = 380.0    # 20 DPS (Hold 60s, Shrink 50s -> t=60..110)
+ZONE_PHASE_2_RADIUS = 240.0    # 35 DPS (Hold 45s, Shrink 40s -> t=110..195)
+ZONE_PHASE_3_RADIUS = 140.0    # 60 DPS (Hold 35s, Shrink 35s -> t=195..265)
+ZONE_PHASE_4_RADIUS = 70.0     # 100 DPS (Hold 30s, Shrink 30s -> t=265..325)
+GAS_BUFFER_DIST = 25.0         # Clamped safety distance inside current zone.radius (m)
+
+# Ohio Stadium Footprint & Concourse Bypass Corridors
+STADIUM_X_MIN = -320.0
+STADIUM_X_MAX = -180.0
+STADIUM_Y_MIN = -60.0
+STADIUM_Y_MAX = 260.0
+STADIUM_BUFFER = 15.0          # Danger buffer around stadium footprint (m)
+STADIUM_BYPASS_SOUTH = (-220.0, -28.0)  # South concourse bypass corridor
+STADIUM_BYPASS_NORTH = (-220.0, 285.0)  # North concourse bypass corridor
+
+# Orbit Geometry
+ORBIT_TARGET_RATIO = 0.75      # Exact target orbit radius: 0.75 * zone.next_radius
+ORBIT_MIN_RATIO = 0.70         # Lower boundary of sweet-spot perimeter band
+ORBIT_MAX_RATIO = 0.80         # Upper boundary of sweet-spot perimeter band
 CRITICAL_INNER_RATIO = 0.45    # Strict no-go inner boundary (0.45 * next_radius)
 ENDGAME_ALIVE_THRESHOLD = 5    # When < 5 mechs remain, Phase 5 endgame relaxes inner boundary
 ENDGAME_ORBIT_RATIO = 0.55     # Compressed orbit radius for endgame cleanup (< 5 alive)
@@ -58,13 +97,15 @@ DIRECTION_HYSTERESIS = 0.20    # Angular threshold required to reverse orbital d
 class FlankOrbitEngine:
     """
     Computes tangential perimeter orbital navigation paths around the safe zone,
-    strictly staying outside the 45% inner crossfire zone while evading active sound brawls.
+    strictly staying outside the 45% inner crossfire zone while evading active sound brawls,
+    observing Ohio Stadium concourse bypass corridors, and respecting energy conservation.
     """
 
     def __init__(self, map_dir: str = "arena"):
         self.map_dir = map_dir
         self.current_direction: int = 1  # +1 for Counter-Clockwise (CCW), -1 for Clockwise (CW)
         self.last_waypoint: Optional[Tuple[float, float]] = None
+        self.last_should_boost: bool = False
 
         # Occupancy grid for obstacle and building cover awareness
         self.meta: Dict[str, Any] = {}
@@ -151,6 +192,95 @@ class FlankOrbitEngine:
         return True
 
     # -----------------------------------------------------------------
+    # Ohio Stadium Geometry & Concourse Bypass Corridors
+    # -----------------------------------------------------------------
+
+    @staticmethod
+    def dist_to_stadium(x: float, y: float) -> float:
+        """
+        Computes Euclidean distance from (x, y) to the Ohio Stadium footprint
+        bounding box: x in [-320, -180], y in [-60, 260].
+        Returns 0.0 if inside the bounding box.
+        """
+        dx = max(0.0, STADIUM_X_MIN - x, x - STADIUM_X_MAX)
+        dy = max(0.0, STADIUM_Y_MIN - y, y - STADIUM_Y_MAX)
+        return math.hypot(dx, dy)
+
+    @classmethod
+    def is_in_stadium_danger_zone(cls, x: float, y: float, buffer: float = STADIUM_BUFFER) -> bool:
+        """Checks if (x, y) is within buffer distance (15m) of the Ohio Stadium footprint."""
+        return cls.dist_to_stadium(x, y) <= buffer
+
+    @classmethod
+    def select_stadium_concourse_corridor(
+        cls,
+        px: float,
+        py: float,
+        tan_vx: float,
+        tan_vy: float
+    ) -> Tuple[float, float]:
+        """
+        Selects the concourse bypass corridor (-220, -28) or (-220, 285)
+        aligned with the bot's current tangential orbital trajectory.
+        """
+        vs_x = STADIUM_BYPASS_SOUTH[0] - px
+        vs_y = STADIUM_BYPASS_SOUTH[1] - py
+        ds = math.hypot(vs_x, vs_y)
+
+        vn_x = STADIUM_BYPASS_NORTH[0] - px
+        vn_y = STADIUM_BYPASS_NORTH[1] - py
+        dn = math.hypot(vn_x, vn_y)
+
+        # Dot product with tangential travel vector
+        dot_s = (tan_vx * vs_x + tan_vy * vs_y) / max(1e-4, ds)
+        dot_n = (tan_vx * vn_x + tan_vy * vn_y) / max(1e-4, dn)
+
+        # If one corridor is clearly in the forward travel direction, choose it
+        if dot_n > dot_s + 0.15:
+            return STADIUM_BYPASS_NORTH
+        elif dot_s > dot_n + 0.15:
+            return STADIUM_BYPASS_SOUTH
+        else:
+            # Otherwise choose whichever corridor is closer
+            return STADIUM_BYPASS_NORTH if dn < ds else STADIUM_BYPASS_SOUTH
+
+    # -----------------------------------------------------------------
+    # Energy Conservation Guard
+    # -----------------------------------------------------------------
+
+    def should_boost(
+        self,
+        current_energy: float,
+        dist_to_waypoint: float = 0.0,
+        is_outside_zone: bool = False
+    ) -> bool:
+        """
+        Energy Conservation Guard:
+        When pulsing boost for orbital repositioning, never let energy drop below 35.0
+        (preserve energy for emergency transverse strafing).
+        
+        Args:
+            current_energy: Mech's current energy [0.0, 100.0].
+            dist_to_waypoint: Distance to the current navigation waypoint (meters).
+            is_outside_zone: Whether the bot is taking gas damage outside the safe zone.
+        
+        Returns:
+            bool: True if safe to boost, False otherwise.
+        """
+        if is_outside_zone:
+            # Emergency gas escape: can burn down to 15.0 (preserve single jump reserve)
+            return current_energy > 15.0
+
+        # Strict Energy Conservation Guard for orbital repositioning:
+        # Boost drain is 17.0/s (0.85/tick at 20Hz).
+        # We require at least 35.0 + 1.0 margin before initiating/continuing boost,
+        # ensuring the energy floor strictly remains >= 35.0 for defensive transverse dodging.
+        if current_energy < ENERGY_GUARD_THRESHOLD:
+            return False
+        
+        return current_energy >= (ENERGY_GUARD_THRESHOLD + 1.0) and dist_to_waypoint > 10.0
+
+    # -----------------------------------------------------------------
     # Sound Cluster & Brawl Centroid Analysis
     # -----------------------------------------------------------------
 
@@ -168,7 +298,6 @@ class FlankOrbitEngine:
 
         sound_list: List[Tuple[float, float, float]] = []
 
-        # Handle list of dicts (from AcousticRadar or custom clusters)
         if isinstance(sound_clusters, list):
             for item in sound_clusters:
                 if isinstance(item, dict):
@@ -191,7 +320,6 @@ class FlankOrbitEngine:
         if not sound_list:
             return None, []
 
-        # Compute weighted center of mass for the sound brawl
         total_w = sum(s[2] for s in sound_list)
         if total_w < 1e-4:
             return None, sound_list
@@ -218,7 +346,6 @@ class FlankOrbitEngine:
             dy = py - sy
             dist = math.hypot(dx, dy)
             if 1.0 < dist < REPULSION_MAX_DIST:
-                # Inverse-distance weighting force
                 force = (w * 10.0) / (dist * dist)
                 rep_x += (dx / dist) * force
                 rep_y += (dy / dist) * force
@@ -254,22 +381,16 @@ class FlankOrbitEngine:
         Includes hysteresis to prevent rapid back-and-forth oscillations.
         """
         if brawl_centroid is None:
-            # Maintain current direction if no active brawl
             return self.current_direction
 
         bx, by = brawl_centroid
         brawl_theta = math.atan2(by - center_y, bx - center_x)
         delta_theta = self._normalize_angle(bot_theta - brawl_theta)
 
-        # delta_theta > 0 means bot is CCW relative to brawl:
-        # Continuing CCW (+1) increases angular distance!
-        # delta_theta < 0 means bot is CW relative to brawl:
-        # Continuing CW (-1) increases angular distance!
+        # delta_theta >= 0 -> CCW increases distance; delta_theta < 0 -> CW increases distance
         desired_dir = 1 if delta_theta >= 0.0 else -1
 
-        # Hysteresis check: only switch if the brawl strongly pulls in the other direction
         if desired_dir != self.current_direction:
-            # If nearly opposite (abs(delta) near pi), both directions are safe, so maintain momentum
             if abs(delta_theta) < (math.pi - DIRECTION_HYSTERESIS) and abs(delta_theta) > DIRECTION_HYSTERESIS:
                 self.current_direction = desired_dir
 
@@ -284,15 +405,18 @@ class FlankOrbitEngine:
         my_pos: Union[List[float], Tuple[float, ...]],
         zone_info: Dict[str, Any],
         sound_clusters: Any = None,
-        alive_count: int = 16
+        alive_count: int = 16,
+        current_energy: float = 100.0
     ) -> Tuple[float, float]:
         """
-        Calculates a tangential orbital movement path that:
-        1. Maintains our bot at a safe distance on the outer perimeter:
-           r = 0.72 to 0.82 * next_radius from next_center.
-        2. Never enters the inner 45% radius of the zone circle until Phase 5 (< 5 mechs alive).
-        3. Tangentially orbits around the circle boundary using terrain and building cover.
-        4. Smoothly navigates away from the centroid of active sound clusters (the center brawl).
+        Calculates a tangential orbital movement path calibrated to battlefield physics:
+        1. Target orbit radius strictly enforced at:
+           r_orbit = 0.75 * zone.next_radius (clamped to stay at least 25m inside zone.radius).
+        2. Never enters the inner 45% radius of next_center until Phase 5 (< 5 mechs alive).
+        3. Ohio Stadium exclusion: if orbital waypoint falls within 15m of stadium footprint,
+           biases tangential vector toward concourse bypass corridors (-220, -28) or (-220, 285).
+        4. Energy Conservation Guard: tracks whether boost pulsing is safe without dropping below 35.0.
+        5. Smoothly evades the active sound brawl centroid while hugging terrain/building cover.
         
         Execution time: strictly < 0.5 ms (target: < 0.02 ms).
         Returns:
@@ -304,14 +428,21 @@ class FlankOrbitEngine:
         px = float(my_pos[0])
         py = float(my_pos[1])
 
-        # Parse zone info
+        # Parse safe zone geometry & dimensions
         nc = zone_info.get("next_center", zone_info.get("center", [0.0, 0.0]))
         cx = float(nc[0])
         cy = float(nc[1])
-        next_radius = float(zone_info.get("next_radius", zone_info.get("radius", 380.0)))
+
+        curr_radius = float(zone_info.get("radius", ZONE_START_RADIUS))
+        next_radius = float(zone_info.get("next_radius", curr_radius))
         next_radius = max(20.0, next_radius)
 
-        # Relative vector from zone center to bot
+        # REFINEMENT 1: Exact Orbital Band & Gas Buffer Guard
+        # Clamped to stay at least 25m inside zone.radius to avoid gas clipping
+        max_safe_radius = max(20.0, curr_radius - GAS_BUFFER_DIST)
+        r_orbit = min(ORBIT_TARGET_RATIO * next_radius, max_safe_radius)
+
+        # Relative vector from next_center to bot
         dx = px - cx
         dy = py - cy
         r = math.hypot(dx, dy)
@@ -332,7 +463,7 @@ class FlankOrbitEngine:
 
         if alive_count >= ENDGAME_ALIVE_THRESHOLD and r < r_crit:
             # EMERGENCY: Inside the 15-bot crossfire slaughterhouse!
-            # Immediate radial sprint outward toward the safe 0.77 * R perimeter.
+            # Immediate radial sprint outward toward the safe 0.75 * R perimeter.
             escape_vx = ur_x + rep_x * 0.5
             escape_vy = ur_y + rep_y * 0.5
             elen = math.hypot(escape_vx, escape_vy)
@@ -340,24 +471,28 @@ class FlankOrbitEngine:
                 escape_vx /= elen
                 escape_vy /= elen
 
-            lookahead = min(DEFAULT_LOOKAHEAD_DIST, max(15.0, (ORBIT_TARGET_RATIO * next_radius) - r))
+            lookahead = min(DEFAULT_LOOKAHEAD_DIST, max(15.0, r_orbit - r))
             waypoint = (px + escape_vx * lookahead, py + escape_vy * lookahead)
+            self.last_waypoint = waypoint
+            self.last_should_boost = self.should_boost(current_energy, lookahead, is_outside_zone=False)
             self._record_telemetry(t0)
             return waypoint
 
         # -------------------------------------------------------------
-        # REQUIREMENT 1: Outer Perimeter Radius (r = 0.72 to 0.82 * R)
+        # REFINEMENT 1: Orbital Band Parameters
         # -------------------------------------------------------------
         if alive_count < ENDGAME_ALIVE_THRESHOLD:
             # Phase 5 Endgame: < 5 mechs remain, center brawl cleared out
-            r_target = ENDGAME_ORBIT_RATIO * next_radius
-            r_min = 0.40 * next_radius
-            r_max = 0.70 * next_radius
+            r_target = min(ENDGAME_ORBIT_RATIO * next_radius, max_safe_radius)
+            r_min = max(10.0, 0.35 * next_radius)
+            r_max = min(max_safe_radius, 0.65 * next_radius)
         else:
-            # Standard Midgame: Strict outer perimeter orbit
-            r_target = ORBIT_TARGET_RATIO * next_radius
-            r_min = ORBIT_MIN_RATIO * next_radius
-            r_max = ORBIT_MAX_RATIO * next_radius
+            # Standard Midgame: Exact 0.75 * next_radius, clamped >= 25m inside zone.radius
+            r_target = r_orbit
+            r_min = max(CRITICAL_INNER_RATIO * next_radius + 5.0, min(r_target - 12.0, ORBIT_MIN_RATIO * next_radius))
+            r_max = min(max_safe_radius, max(r_target + 12.0, ORBIT_MAX_RATIO * next_radius))
+            r_min = min(r_min, r_target)
+            r_max = max(r_max, r_target)
 
         # Determine orbital direction (CCW vs CW) away from sound brawl
         orbit_dir = self._determine_orbit_direction(theta, brawl_centroid, cx, cy)
@@ -370,17 +505,17 @@ class FlankOrbitEngine:
         # Radial & Tangential Velocity Blending
         # -------------------------------------------------------------
         if r < r_min:
-            # Inside perimeter band: spiral outward toward 0.77 * R
+            # Inside perimeter band: spiral outward toward r_target
             fraction_out = min(1.0, (r_target - r) / max(1.0, 0.15 * next_radius))
             v_radial = fraction_out
             v_tangential = math.sqrt(max(0.0, 1.0 - v_radial * v_radial))
         elif r > r_max:
-            # Outside perimeter band: spiral inward toward 0.77 * R
+            # Outside perimeter band: spiral inward toward r_target
             fraction_in = min(1.0, (r - r_target) / max(1.0, 0.15 * next_radius))
             v_radial = -fraction_in
             v_tangential = math.sqrt(max(0.0, 1.0 - v_radial * v_radial))
         else:
-            # In sweet spot [0.72, 0.82]: pure tangential motion with gentle centering spring
+            # In sweet spot: pure tangential motion with gentle centering spring
             err_r = (r_target - r) / max(1.0, 0.05 * next_radius)
             v_radial = err_r * 0.25
             v_tangential = math.sqrt(max(0.0, 1.0 - v_radial * v_radial))
@@ -395,21 +530,64 @@ class FlankOrbitEngine:
             desired_vy /= vlen
 
         # -------------------------------------------------------------
-        # REQUIREMENT 3: Terrain & Building Cover Steering
+        # REFINEMENT 3: Ohio Stadium Exclusion & Concourse Bypass
         # -------------------------------------------------------------
-        # Sample candidate forward waypoints to avoid walking into building walls
+        # Check if the prospective forward trajectory falls within 15m of Ohio Stadium footprint
+        tentative_x = px + desired_vx * DEFAULT_LOOKAHEAD_DIST
+        tentative_y = py + desired_vy * DEFAULT_LOOKAHEAD_DIST
+
+        near_stadium = (
+            self.is_in_stadium_danger_zone(tentative_x, tentative_y, STADIUM_BUFFER)
+            or self.is_in_stadium_danger_zone(px, py, STADIUM_BUFFER)
+        )
+
+        chosen_corridor: Optional[Tuple[float, float]] = None
+        if near_stadium:
+            chosen_corridor = self.select_stadium_concourse_corridor(px, py, desired_vx, desired_vy)
+            c_dx = chosen_corridor[0] - px
+            c_dy = chosen_corridor[1] - py
+            c_dist = math.hypot(c_dx, c_dy)
+            if c_dist > 1.0:
+                c_ux = c_dx / c_dist
+                c_uy = c_dy / c_dist
+                # Bias the tangential vector toward the concourse bypass corridor
+                bias_weight = 0.70
+                desired_vx = (1.0 - bias_weight) * desired_vx + bias_weight * c_ux
+                desired_vy = (1.0 - bias_weight) * desired_vy + bias_weight * c_uy
+                dlen = math.hypot(desired_vx, desired_vy)
+                if dlen > 1e-4:
+                    desired_vx /= dlen
+                    desired_vy /= dlen
+
+        # -------------------------------------------------------------
+        # Terrain & Building Cover Steering with Candidate Rays
+        # -------------------------------------------------------------
         lookahead = DEFAULT_LOOKAHEAD_DIST
-        candidate_angles = [0.0, 0.25, -0.25, 0.50, -0.50]
+        candidate_angles = [0.0, 0.25, -0.25, 0.50, -0.50, 0.75, -0.75]
         base_yaw = math.atan2(desired_vy, desired_vx)
 
-        best_waypoint: Optional[Tuple[float, float]] = None
-        best_score = -float("inf")
-
+        candidate_points: List[Tuple[float, float, float]] = []
         for d_yaw in candidate_angles:
             test_yaw = base_yaw + d_yaw * orbit_dir
             cand_x = px + math.cos(test_yaw) * lookahead
             cand_y = py + math.sin(test_yaw) * lookahead
+            candidate_points.append((cand_x, cand_y, d_yaw))
 
+        # If near stadium, explicitly evaluate a direct step toward the bypass corridor
+        if chosen_corridor is not None:
+            c_dx = chosen_corridor[0] - px
+            c_dy = chosen_corridor[1] - py
+            c_dist = math.hypot(c_dx, c_dy)
+            c_step = min(lookahead, max(5.0, c_dist))
+            if c_dist > 1e-4:
+                cand_x = px + (c_dx / c_dist) * c_step
+                cand_y = py + (c_dy / c_dist) * c_step
+                candidate_points.append((cand_x, cand_y, 0.0))
+
+        best_waypoint: Optional[Tuple[float, float]] = None
+        best_score = -float("inf")
+
+        for cand_x, cand_y, d_yaw in candidate_points:
             # Check if candidate is inside a solid building obstacle
             if self.is_solid_obstacle(cand_x, cand_y):
                 continue
@@ -420,14 +598,35 @@ class FlankOrbitEngine:
             # Penalty for violating the 45% inner circle during midgame
             inner_penalty = 0.0
             if alive_count >= ENDGAME_ALIVE_THRESHOLD and cand_r < r_crit:
-                inner_penalty = 100.0 * (1.0 - cand_r / r_crit)
+                inner_penalty = 120.0 * (1.0 - cand_r / r_crit)
 
-            # Score: reward remaining in perimeter band [0.72, 0.82] and away from sound brawl
+            # Stadium footprint avoidance & concourse progression scoring
+            stadium_score = 0.0
+            if chosen_corridor is not None:
+                cand_dist_corr = math.hypot(cand_x - chosen_corridor[0], cand_y - chosen_corridor[1])
+                bot_dist_corr = math.hypot(px - chosen_corridor[0], py - chosen_corridor[1])
+                # Reward moving closer to the concourse bypass corridor
+                if cand_dist_corr < bot_dist_corr:
+                    stadium_score += 25.0 * (1.0 - cand_dist_corr / max(1.0, bot_dist_corr))
+                
+                # Penalize candidates inside the 15m stadium buffer unless at the corridor
+                if self.is_in_stadium_danger_zone(cand_x, cand_y, STADIUM_BUFFER):
+                    if cand_dist_corr > 15.0:
+                        stadium_score -= 50.0
+
+            # Score: reward remaining in perimeter band and away from sound brawl
             band_error = abs(cand_r - r_target)
             sound_dist = math.hypot(cand_x - brawl_centroid[0], cand_y - brawl_centroid[1]) if brawl_centroid else 100.0
             walkable_bonus = 15.0 if self.is_walkable(cand_x, cand_y) else 0.0
 
-            score = walkable_bonus + (sound_dist * 0.2) - (band_error * 0.5) - (abs(d_yaw) * 5.0) - inner_penalty
+            score = (
+                walkable_bonus
+                + (sound_dist * 0.2)
+                - (band_error * 0.5)
+                - (abs(d_yaw) * 4.0)
+                - inner_penalty
+                + stadium_score
+            )
 
             if score > best_score:
                 best_score = score
@@ -440,6 +639,12 @@ class FlankOrbitEngine:
             best_waypoint = (px + math.cos(rev_yaw) * lookahead, py + math.sin(rev_yaw) * lookahead)
 
         self.last_waypoint = best_waypoint
+
+        # REFINEMENT 2: Energy Conservation Guard Evaluation
+        wp_dist = math.hypot(best_waypoint[0] - px, best_waypoint[1] - py)
+        is_outside = r > curr_radius
+        self.last_should_boost = self.should_boost(current_energy, wp_dist, is_outside)
+
         self._record_telemetry(t0)
         return best_waypoint
 
@@ -472,6 +677,7 @@ def get_flank_waypoint(
     zone_info: Dict[str, Any],
     sound_clusters: Any = None,
     alive_count: int = 16,
+    current_energy: float = 100.0,
     engine: Optional[FlankOrbitEngine] = None
 ) -> Tuple[float, float]:
     """
@@ -479,7 +685,21 @@ def get_flank_waypoint(
     Exposes clean signature for bot.py and external systems.
     """
     eng = engine or get_flank_orbit_engine()
-    return eng.get_flank_waypoint(my_pos, zone_info, sound_clusters, alive_count)
+    return eng.get_flank_waypoint(my_pos, zone_info, sound_clusters, alive_count, current_energy)
+
+
+def should_boost(
+    current_energy: float,
+    dist_to_waypoint: float = 0.0,
+    is_outside_zone: bool = False,
+    engine: Optional[FlankOrbitEngine] = None
+) -> bool:
+    """
+    Convenience wrapper for Energy Conservation Guard.
+    Ensures energy never drops below 35.0 during orbital repositioning.
+    """
+    eng = engine or get_flank_orbit_engine()
+    return eng.should_boost(current_energy, dist_to_waypoint, is_outside_zone)
 
 
 # =====================================================================
@@ -488,12 +708,13 @@ def get_flank_waypoint(
 
 if __name__ == "__main__":
     print("=" * 72)
-    print("ATLAS - FLANK ORBIT ENGINE (MACRO FLANKING & PERIMETER ORBITING)")
+    print("ATLAS - FLANK ORBIT ENGINE (PHASE 2: GROUNDED KINEMATICS CALIBRATION)")
     print("=" * 72)
 
     engine = FlankOrbitEngine(map_dir="arena")
     print(f"[OK] FlankOrbitEngine initialized. Grid loaded: {engine.grid is not None}")
 
+    # Standard Zone Info (Phase 2 state: radius=380m, next_radius=240m)
     sample_zone = {
         "center": [0.0, 0.0],
         "radius": 380.0,
@@ -503,28 +724,86 @@ if __name__ == "__main__":
     }
     nc = sample_zone["next_center"]
     nr = sample_zone["next_radius"]
+    cr = sample_zone["radius"]
 
     # -------------------------------------------------------------
-    # TEST 1: Outer Perimeter Radius (r = 0.72 to 0.82 * R)
+    # TEST 1: Exact Orbital Band (r_orbit = 0.75 * next_radius & Gas Clamp)
     # -------------------------------------------------------------
-    print("\n=== TEST 1: Outer Perimeter Radius Orbit Band ===")
-    r_target = 0.77 * nr  # 184.8m
-    r_min = 0.72 * nr     # 172.8m
-    r_max = 0.82 * nr     # 196.8m
-    print(f"  Target radius: {r_target:.1f}m | Safe perimeter band: [{r_min:.1f}m, {r_max:.1f}m]")
+    print("\n=== TEST 1: Exact Orbital Band Calibration (0.75 * next_radius & Gas Clamp) ===")
+    r_target_expected = 0.75 * nr  # 180.0m
+    gas_limit = cr - GAS_BUFFER_DIST  # 380 - 25 = 355.0m
+    print(f"  Target: r_orbit = 0.75 * {nr:.1f}m = {r_target_expected:.1f}m | Gas limit: {gas_limit:.1f}m")
 
-    # Start inside the band at angle 0: (-20 + 185, 15) = (165, 15)
-    start_pos = [nc[0] + r_target, nc[1]]
+    # Start on the 0.75 * next_radius perimeter at angle 0: (-20 + 180, 15) = (160, 15)
+    start_pos = [nc[0] + r_target_expected, nc[1]]
     wp1 = engine.get_flank_waypoint(start_pos, sample_zone, sound_clusters=[], alive_count=14)
     dist_wp1 = math.hypot(wp1[0] - nc[0], wp1[1] - nc[1])
-    print(f"  [PASS] At sweet-spot r={r_target:.1f}m -> Waypoint: ({wp1[0]:.1f}, {wp1[1]:.1f}) at r={dist_wp1:.1f}m")
-    assert r_min <= dist_wp1 <= r_max + 10.0, "Waypoint should remain along perimeter band"
+    print(f"  [PASS] At sweet-spot r={r_target_expected:.1f}m -> Waypoint: ({wp1[0]:.1f}, {wp1[1]:.1f}) at r={dist_wp1:.1f}m")
+    assert abs(dist_wp1 - r_target_expected) < 15.0, f"Waypoint should remain near 0.75 * next_radius ({r_target_expected:.1f}m)"
+
+    # Test Gas Buffer Clamp: When current zone has shrunk down close to next_radius
+    tight_zone = {
+        "center": [0.0, 0.0],
+        "radius": 190.0,            # Gas boundary is at 190m!
+        "next_center": [0.0, 0.0],
+        "next_radius": 240.0,       # 0.75 * 240 = 180m, but 190 - 25 = 165m!
+    }
+    tight_gas_clamp = tight_zone["radius"] - GAS_BUFFER_DIST  # 165.0m
+    wp_gas = engine.get_flank_waypoint([170.0, 0.0], tight_zone, sound_clusters=[], alive_count=14)
+    dist_wp_gas = math.hypot(wp_gas[0], wp_gas[1])
+    print(f"  [PASS] Gas Clamp Active: curr_radius=190m -> Clamped to {tight_gas_clamp:.1f}m. Waypoint at r={dist_wp_gas:.1f}m <= 165m")
+    assert dist_wp_gas <= tight_gas_clamp + 5.0, "Waypoint MUST be clamped at least 25m inside curr_radius to avoid gas clipping!"
 
     # -------------------------------------------------------------
-    # TEST 2: Strict Inner 45% Exclusion Enforcement
+    # TEST 2: Energy Conservation Guard (Threshold >= 35.0)
     # -------------------------------------------------------------
-    print("\n=== TEST 2: Strict Inner 45% Exclusion Enforcement (alive >= 5) ===")
-    r_crit = 0.45 * nr  # 108.0m
+    print("\n=== TEST 2: Energy Conservation Guard (Preserve Energy >= 35.0) ===")
+    assert engine.should_boost(current_energy=100.0, dist_to_waypoint=25.0) is True, "Should boost at full energy"
+    assert engine.should_boost(current_energy=36.0, dist_to_waypoint=25.0) is True, "Should boost when above 35.0 guard margin"
+    assert engine.should_boost(current_energy=35.0, dist_to_waypoint=25.0) is False, "Must NOT boost when at exactly 35.0 threshold"
+    assert engine.should_boost(current_energy=34.0, dist_to_waypoint=25.0) is False, "Must NOT boost when below 35.0 threshold"
+    assert engine.should_boost(current_energy=20.0, dist_to_waypoint=25.0) is False, "Must NOT boost at low energy"
+    # Outside zone emergency boost override
+    assert engine.should_boost(current_energy=25.0, dist_to_waypoint=25.0, is_outside_zone=True) is True, "Gas escape allows boosting down to 15.0"
+    assert engine.should_boost(current_energy=14.0, dist_to_waypoint=25.0, is_outside_zone=True) is False, "Emergency gas escape halts at 15.0 jump reserve"
+    print("  [PASS] Energy Conservation Guard strictly prevents boosting when energy <= 35.0.")
+
+    # -------------------------------------------------------------
+    # TEST 3: Ohio Stadium Exclusion & Concourse Bypass Corridors
+    # -------------------------------------------------------------
+    print("\n=== TEST 3: Ohio Stadium Exclusion & Concourse Corridors ===")
+    # Ohio Stadium: X in [-320, -180], Y in [-60, 260]. Buffer = 15m
+    # Concourse bypass corridors: South (-220, -28), North (-220, 285)
+    print(f"  Ohio Stadium Footprint: X in [{STADIUM_X_MIN}, {STADIUM_X_MAX}], Y in [{STADIUM_Y_MIN}, {STADIUM_Y_MAX}]")
+    print(f"  Concourse Bypass Corridors: South {STADIUM_BYPASS_SOUTH} | North {STADIUM_BYPASS_NORTH}")
+
+    # Point inside stadium danger zone: (-330, 20) is within 10m of west wall
+    assert engine.is_in_stadium_danger_zone(-330.0, 20.0) is True, "Point (-330, 20) should be in stadium danger zone"
+    assert engine.is_in_stadium_danger_zone(-100.0, 0.0) is False, "Point (-100, 0) should be well outside danger zone"
+
+    # Test South Bypass selection: Bot located near southern stadium edge moving southwards
+    south_bot_pos = [-330.0, -10.0]
+    corridor_south = engine.select_stadium_concourse_corridor(south_bot_pos[0], south_bot_pos[1], tan_vx=0.0, tan_vy=-1.0)
+    print(f"  Bot near South stadium moving South -> Corridor chosen: {corridor_south}")
+    assert corridor_south == STADIUM_BYPASS_SOUTH, "Should select South concourse bypass (-220, -28)"
+
+    # Test North Bypass selection: Bot located near northern stadium edge moving northwards
+    north_bot_pos = [-330.0, 220.0]
+    corridor_north = engine.select_stadium_concourse_corridor(north_bot_pos[0], north_bot_pos[1], tan_vx=0.0, tan_vy=1.0)
+    print(f"  Bot near North stadium moving North -> Corridor chosen: {corridor_north}")
+    assert corridor_north == STADIUM_BYPASS_NORTH, "Should select North concourse bypass (-220, 285)"
+
+    # Test waypoint steering away from stadium wall into concourse bypass
+    stadium_wp = engine.get_flank_waypoint(south_bot_pos, sample_zone, sound_clusters=[], alive_count=12)
+    dist_to_south_corr = math.hypot(stadium_wp[0] - STADIUM_BYPASS_SOUTH[0], stadium_wp[1] - STADIUM_BYPASS_SOUTH[1])
+    print(f"  [PASS] Stadium Avoidance Waypoint: ({stadium_wp[0]:.1f}, {stadium_wp[1]:.1f}) steering toward South corridor (dist={dist_to_south_corr:.1f}m)")
+    assert not engine.is_solid_obstacle(stadium_wp[0], stadium_wp[1]), "Waypoint MUST NOT be inside solid stadium structure!"
+
+    # -------------------------------------------------------------
+    # TEST 4: Strict Inner 45% Exclusion Enforcement
+    # -------------------------------------------------------------
+    print("\n=== TEST 4: Strict Inner 45% Exclusion Enforcement (alive >= 5) ===")
+    r_crit = CRITICAL_INNER_RATIO * nr  # 108.0m
     inner_danger_pos = [nc[0] + 50.0, nc[1] + 20.0]  # r ~ 53.8m (< 108m)
     dist_inner = math.hypot(inner_danger_pos[0] - nc[0], inner_danger_pos[1] - nc[1])
     print(f"  Critical inner radius: {r_crit:.1f}m | Bot spawned dangerously at r={dist_inner:.1f}m")
@@ -535,38 +814,34 @@ if __name__ == "__main__":
     assert dist_escape_wp > dist_inner, "Emergency waypoint MUST direct bot outward away from center!"
 
     # -------------------------------------------------------------
-    # TEST 3: Phase 5 Endgame Transition (< 5 mechs alive)
+    # TEST 5: Phase 5 Endgame Transition (< 5 mechs alive)
     # -------------------------------------------------------------
-    print("\n=== TEST 3: Phase 5 Endgame Transition (< 5 mechs alive) ===")
+    print("\n=== TEST 5: Phase 5 Endgame Transition (< 5 mechs alive) ===")
     endgame_wp = engine.get_flank_waypoint(inner_danger_pos, sample_zone, sound_clusters=[], alive_count=3)
     dist_endgame_wp = math.hypot(endgame_wp[0] - nc[0], endgame_wp[1] - nc[1])
     print(f"  [PASS] Endgame Mode (alive=3): Inner 45% rule relaxed. Waypoint at r={dist_endgame_wp:.1f}m")
 
     # -------------------------------------------------------------
-    # TEST 4: Smooth Active Sound Cluster / Brawl Avoidance
+    # TEST 6: Smooth Active Sound Cluster / Brawl Avoidance
     # -------------------------------------------------------------
-    print("\n=== TEST 4: Active Sound Cluster / Center Brawl Avoidance ===")
-    # Sound brawl located to the East of center
+    print("\n=== TEST 6: Active Sound Cluster / Center Brawl Avoidance ===")
     sound_brawl = [
         {"x": nc[0] + 60.0, "y": nc[1], "weight": 2.0},
         {"x": nc[0] + 80.0, "y": nc[1] + 10.0, "weight": 1.5}
     ]
-    # Bot located at East perimeter: near the brawl
-    east_pos = [nc[0] + r_target, nc[1] + 5.0]
+    east_pos = [nc[0] + r_target_expected, nc[1] + 5.0]
     evade_wp = engine.get_flank_waypoint(east_pos, sample_zone, sound_clusters=sound_brawl, alive_count=10)
     print(f"  Brawl at East -> Bot at East -> Evade Waypoint: ({evade_wp[0]:.1f}, {evade_wp[1]:.1f})")
-    # Verify direction moves away from East along Y
     assert abs(evade_wp[1] - east_pos[1]) > 5.0, "Must steer tangentially away from brawl"
     print("  [PASS] Successfully deflected trajectory tangentially away from active sound clusters.")
 
     # -------------------------------------------------------------
-    # TEST 5: Orbit Simulation Convergence Across 60 Ticks
+    # TEST 7: Orbit Simulation Convergence Across 60 Ticks
     # -------------------------------------------------------------
-    print("\n=== TEST 5: Full Orbit Convergence Trajectory Simulation ===")
-    sim_pos = [nc[0] + 280.0, nc[1]]  # Start far outside (r = 280m > 196.8m)
+    print("\n=== TEST 7: Full Orbit Convergence Trajectory Simulation ===")
+    sim_pos = [nc[0] + 280.0, nc[1]]  # Start far outside (r = 280m > 180m)
     for _ in range(60):
         next_wp = engine.get_flank_waypoint(sim_pos, sample_zone, sound_clusters=[], alive_count=12)
-        # Step 6m toward waypoint
         vx = next_wp[0] - sim_pos[0]
         vy = next_wp[1] - sim_pos[1]
         vlen = math.hypot(vx, vy)
@@ -574,11 +849,11 @@ if __name__ == "__main__":
         sim_pos[1] += (vy / vlen) * 6.0
 
     final_r = math.hypot(sim_pos[0] - nc[0], sim_pos[1] - nc[1])
-    print(f"  [PASS] 60-step simulated orbit: Started at r=280m -> Converged to r={final_r:.1f}m (Target: {r_target:.1f}m)")
-    assert r_min - 5.0 <= final_r <= r_max + 5.0, "Simulated trajectory converged perfectly into perimeter band"
+    print(f"  [PASS] 60-step simulated orbit: Started at r=280m -> Converged to r={final_r:.1f}m (Target: {r_target_expected:.1f}m)")
+    assert abs(final_r - r_target_expected) < 15.0, "Simulated trajectory converged perfectly into perimeter band"
 
     # -------------------------------------------------------------
-    # TEST 6: Strict Latency Benchmark (< 0.5 ms constraint)
+    # TEST 8: Strict Latency Benchmark (< 0.5 ms constraint)
     # -------------------------------------------------------------
     print("\n" + "=" * 72)
     print("BENCHMARK TEST: Query Execution Latency (< 0.5 ms constraint)")
@@ -593,7 +868,7 @@ if __name__ == "__main__":
     for i in range(N):
         mpos = [float(test_positions[i, 0]), float(test_positions[i, 1])]
         t_q = time.perf_counter()
-        engine.get_flank_waypoint(mpos, sample_zone, sound_clusters=sound_brawl, alive_count=12)
+        engine.get_flank_waypoint(mpos, sample_zone, sound_clusters=sound_brawl, alive_count=12, current_energy=60.0)
         latencies.append((time.perf_counter() - t_q) * 1000.0)
 
     t_bench_total = time.perf_counter() - t_bench_start

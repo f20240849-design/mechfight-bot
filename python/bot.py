@@ -176,6 +176,14 @@ class Bot:
         # Use BALLIS Dynamic Target Scorer (selects lowest HP / rear-armor targets or early NPCs)
         optimal_target = self.artillery.select_optimal_target([x, y, z], obs.get("mechs", []), t)
         closest_enemy = optimal_target if optimal_target else (visible_enemies[0] if visible_enemies else None)
+        
+        # LOS-prioritization guard: If current target has no LOS, check if another visible enemy player has LOS!
+        if visible_enemies:
+            los_enemies = [e for e in visible_enemies if self.nav.has_los(x, y, e["pos"][0], e["pos"][1])]
+            if los_enemies:
+                if not closest_enemy or not self.nav.has_los(x, y, closest_enemy["pos"][0], closest_enemy["pos"][1]):
+                    closest_enemy = min(los_enemies, key=lambda e: (e["pos"][0] - x)**2 + (e["pos"][1] - y)**2)
+
         enemy_dist = math.hypot(closest_enemy["pos"][0] - x, closest_enemy["pos"][1] - y) if closest_enemy else 1e9
 
         # 4. High-Level Decision Engine (Disciplined Opportunist & Zone Gatekeeper)
@@ -287,7 +295,12 @@ class Bot:
             should_boost = enemy_dist < 35.0
 
         # --- Priority 3: Supply Drop Snatcher (CHOKE Drop Interceptor) ---
-        drop_target = self.gatekeeper.evaluate_drop_objective((x, y), obs.get("drops", []), visible_enemies, t)
+        # Combat Priority Guard: If enemy is in close range (< 42m) or actively damaging us, engage in combat first!
+        drop_target = None
+        is_combat_busy = closest_enemy and (enemy_dist < 42.0 or time_since_combat < 2.5)
+        if not is_combat_busy:
+            drop_target = self.gatekeeper.evaluate_drop_objective((x, y), obs.get("drops", []), visible_enemies, t)
+
         if drop_target is not None:
             self.active_state = "DROP_CAPTURE"
             nav_target = drop_target
@@ -346,20 +359,19 @@ class Bot:
         has_enemy_los = False
         if closest_enemy:
             has_enemy_los = self.nav.has_los(x, y, closest_enemy["pos"][0], closest_enemy["pos"][1])
-            if has_enemy_los:
-                w1 = me["weapons"][1]
-                w0 = me["weapons"][0]
-                holds_laser = (w1 and w1.get("kind") == "laser") or (w0 and w0.get("kind") == "laser")
-                if holds_laser:
-                    yaw, pitch = self.ballistics.compute_laser_aim([x, y, z], closest_enemy["pos"])
-                else:
-                    yaw, pitch, _ = self.ballistics.compute_lead_aim(
-                        [x, y, z],
-                        closest_enemy["pos"],
-                        closest_enemy.get("vel", [0, 0, 0]),
-                        self.ballistics.gun_speed
-                    )
-                torso_aim = (yaw, pitch)
+            w1 = me["weapons"][1]
+            w0 = me["weapons"][0]
+            holds_laser = (w1 and w1.get("kind") == "laser") or (w0 and w0.get("kind") == "laser")
+            if holds_laser and has_enemy_los:
+                yaw, pitch = self.ballistics.compute_laser_aim([x, y, z], closest_enemy["pos"])
+            else:
+                yaw, pitch, _ = self.ballistics.compute_lead_aim(
+                    [x, y, z],
+                    closest_enemy["pos"],
+                    closest_enemy.get("vel", [0, 0, 0]),
+                    self.ballistics.gun_speed
+                )
+            torso_aim = (yaw, pitch)
 
         # Unified Artillery & Weapon evaluation (Laser peek, Lightning cone, Mortar siege, Gun burst)
         art_res = self.artillery.evaluate_combat_tick(
@@ -376,7 +388,7 @@ class Bot:
         should_fire = [should_fire[0] or art_fire[0], should_fire[1] or art_fire[1]]
         if art_res.get("tactical_move") == "SIEGE_DROP":
             torso_aim = (art_res["aim"][0], art_res["aim"][1])
-        elif art_res.get("aim") and closest_enemy and (me["weapons"][1] and me["weapons"][1].get("kind") in ("laser", "mortar")):
+        elif art_res.get("aim") and closest_enemy:
             torso_aim = (art_res["aim"][0], art_res["aim"][1])
 
         # Gun trigger discipline: only fire at enemy if aim yaw is reasonably aligned (< 0.22 rad / 12.6 deg)!

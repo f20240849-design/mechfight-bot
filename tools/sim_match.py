@@ -129,6 +129,16 @@ class MatchSim:
             "map": {"dir": os.path.join(ROOT, "arena")}
         }
         self.hero_bot = Bot(hello_msg)
+        self.nav = self.hero_bot.nav
+
+        # Ensure all spawn positions are walkable
+        for m in self.mechs:
+            if not self.nav.is_walkable(m.pos[0], m.pos[1]):
+                c_2m = int((m.pos[0] - self.nav.min_x) / 2.0)
+                r_2m = int((m.pos[1] - self.nav.min_y) / 2.0)
+                nc, nr = self.nav.find_nearest_walkable_2m(c_2m, r_2m)
+                m.pos[0] = self.nav.min_x + nc * 2.0 + 1.0
+                m.pos[1] = self.nav.min_y + nr * 2.0 + 1.0
 
     def _spawn_initial_loot(self):
         # 30 floor weapons (lasers, lightnings, mortars)
@@ -352,8 +362,16 @@ class MatchSim:
         else:
             hero.vel = [0.0, 0.0, 0.0]
 
-        hero.pos[0] += hero.vel[0] * self.dt
-        hero.pos[1] += hero.vel[1] * self.dt
+        # Walkable check with sliding
+        nx = hero.pos[0] + hero.vel[0] * self.dt
+        ny = hero.pos[1] + hero.vel[1] * self.dt
+        if self.nav.is_walkable(nx, ny):
+            hero.pos[0] = nx
+            hero.pos[1] = ny
+        elif self.nav.is_walkable(nx, hero.pos[1]):
+            hero.pos[0] = nx
+        elif self.nav.is_walkable(hero.pos[0], ny):
+            hero.pos[1] = ny
 
         # Firing
         fire = act.get("fire", [False, False])
@@ -383,8 +401,16 @@ class MatchSim:
             m.vel[1] = (dy / dist_to_center) * 11.7
         else:
             m.vel = [0.0, 0.0, 0.0]
-        m.pos[0] += m.vel[0] * self.dt
-        m.pos[1] += m.vel[1] * self.dt
+        # Walkable check with sliding
+        nx_pos = m.pos[0] + m.vel[0] * self.dt
+        ny_pos = m.pos[1] + m.vel[1] * self.dt
+        if self.nav.is_walkable(nx_pos, ny_pos):
+            m.pos[0] = nx_pos
+            m.pos[1] = ny_pos
+        elif self.nav.is_walkable(nx_pos, m.pos[1]):
+            m.pos[0] = nx_pos
+        elif self.nav.is_walkable(m.pos[0], ny_pos):
+            m.pos[1] = ny_pos
 
         # Find closest living target (hero or other naive bot)
         closest_target = None
@@ -456,6 +482,8 @@ class MatchSim:
             t_dist = math.hypot(tx, ty)
             if t_dist > 230.0:
                 continue
+            if not self.nav.has_los(shooter.pos[0], shooter.pos[1], target.pos[0], target.pos[1]):
+                continue
 
             # Project target onto bullet ray
             proj = tx * cos_y + ty * sin_y
@@ -494,6 +522,8 @@ class MatchSim:
             ty = target.pos[1] - shooter.pos[1]
             if math.hypot(tx, ty) > 280.0:
                 continue
+            if not self.nav.has_los(shooter.pos[0], shooter.pos[1], target.pos[0], target.pos[1]):
+                continue
             proj = tx * cos_y + ty * sin_y
             if proj > 0:
                 perp = abs(tx * sin_y - ty * cos_y)
@@ -521,6 +551,8 @@ class MatchSim:
             dy = target.pos[1] - shooter.pos[1]
             dist = math.hypot(dx, dy)
             if dist <= 40.0:
+                if not self.nav.has_los(shooter.pos[0], shooter.pos[1], target.pos[0], target.pos[1]):
+                    continue
                 bearing = math.atan2(dy, dx)
                 diff = abs(math.atan2(math.sin(bearing - shooter.aim[0]), math.cos(bearing - shooter.aim[0])))
                 if diff <= math.radians(15.0):
