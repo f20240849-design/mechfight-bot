@@ -909,8 +909,12 @@ def select_optimal_target(
     if not visible_mechs:
         return None
 
-    # 1. NPCHunter check during the opening 60 seconds
-    if current_time < 60.0:
+    # 1. NPCHunter check during the opening 60 seconds (only if no player mech is threatening within 55m)
+    nearby_mechs = [
+        m for m in visible_mechs
+        if m.get("kind") == "mech" and m.get("hp", 0) > 0 and math.hypot(m["pos"][0] - my_pos[0], m["pos"][1] - my_pos[1]) < 55.0
+    ]
+    if current_time < 60.0 and not nearby_mechs:
         hunter = NPCHunter(hunt_window_s=60.0, max_hunt_dist=90.0)
         npc_target = hunter.find_target(my_pos, visible_mechs, current_time)
         if npc_target is not None:

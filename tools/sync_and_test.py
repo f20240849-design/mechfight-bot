@@ -42,6 +42,7 @@ def sync_modules():
     
     mapping = {
         "modules/verticality/rooftops.py": ["rooftops.py", "python/rooftops.py"],
+        "modules/verticality/flank_orbit.py": ["flank_orbit.py", "python/flank_orbit.py"],
         "modules/artillery/artillery.py": ["artillery.py", "python/artillery.py"],
         "modules/gatekeeper/gatekeeper.py": ["gatekeeper.py", "python/gatekeeper.py"],
     }
@@ -65,6 +66,7 @@ def test_modules() -> bool:
         ("python3 -c 'from artillery import ArtillerySystem; print(\"ArtillerySystem OK\")'", "Artillery Integration Check"),
         ("python3 -c 'from gatekeeper import ZoneGatekeeper; print(\"ZoneGatekeeper OK\")'", "Gatekeeper Integration Check"),
         ("python3 -c 'from rooftops import RooftopManager; print(\"RooftopManager OK\")'", "Rooftop Integration Check"),
+        ("python3 -c 'from flank_orbit import FlankOrbitEngine; print(\"FlankOrbitEngine OK\")'", "Flank Orbit Integration Check"),
     ]
 
     for cmd, desc in tests:
@@ -85,12 +87,12 @@ def deploy_to_github():
     print("=" * 65)
 
     cmds = [
-        "git add bot.py nav.py ballistics.py combat.py acoustics.py artillery.py gatekeeper.py rooftops.py modules/",
+        "git add Dockerfile data/ bot.py nav.py ballistics.py combat.py acoustics.py artillery.py gatekeeper.py rooftops.py flank_orbit.py modules/ tools/",
         "git add python/",
-        "git commit -m 'Auto-integrate multi-agent modules (ATLAS, BALLIS, CHOKE)' || echo 'No new changes to commit'",
+        "git commit -m 'Deploy complete macro suite: Flank Orbit, NPC Hunter, Supply Drop Interceptor' || echo 'No new changes to commit'",
         "git push origin main",
         "git checkout release",
-        "git merge main -m 'Sync multi-agent release'",
+        "git merge main -m 'Sync macro suite to release'",
         "git push origin release",
         "git checkout main"
     ]
