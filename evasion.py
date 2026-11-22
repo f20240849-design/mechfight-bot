@@ -231,9 +231,16 @@ class EvasionSystem:
         # 4. FINALIZE DODGE VECTOR
         # -------------------------------------------------------------
         dodge_vec = None
-        force_mag = math.hypot(dodge_fx, dodge_fy)
-        if force_mag > 0.05 and threat_level > 0.15:
-            dodge_vec = [dodge_fx / force_mag, dodge_fy / force_mag]
+        # Hitscan Laser Defense: Strafing does NOT dodge a hitscan laser in open terrain.
+        # Only solid cover beats it. Suppress lateral dodge_vec so the bot sprints
+        # directly into building cover with boost rather than wiggling in the open!
+        if primary_source == "laser_charge":
+            dodge_vec = None
+            should_boost = True
+        else:
+            force_mag = math.hypot(dodge_fx, dodge_fy)
+            if force_mag > 0.05 and threat_level > 0.15:
+                dodge_vec = [dodge_fx / force_mag, dodge_fy / force_mag]
 
         return {
             "threat_level": min(1.0, threat_level),

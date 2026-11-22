@@ -1798,7 +1798,16 @@ class ArtillerySystem:
                 elif w_kind == "gun":
                     ammo = w.get("ammo", 0)
                     reload_s = w.get("reload", 0.0)
-                    if has_los and ammo > 0 and reload_s == 0.0 and w_cd <= 0.05:
+                    # Gun trigger discipline (Section 1 & 4):
+                    # Gunfire audio carries 320 METERS. At > 55m, arm gun deals low effective DPS
+                    # due to 0.6 deg spread and 0.25-0.6s flight time while painting an acoustic bullseye.
+                    # Never duel a Laser bot with Gun past 40m!
+                    max_gun_range = 40.0 if "laser" in target_weapons else 55.0
+                    target_hp = target.get("hp", 1000.0)
+                    if target_hp <= 90.0:
+                        max_gun_range = 75.0  # Finish low-HP kill
+
+                    if has_los and t_dist <= max_gun_range and ammo > 0 and reload_s == 0.0 and w_cd <= 0.05:
                         result_fire[slot_idx] = True
                         t_vel = target.get("vel", [0.0, 0.0, 0.0])
                         lead_yaw, lead_pitch, _ = compute_exact_predictive_lead(
