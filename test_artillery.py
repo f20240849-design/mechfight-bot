@@ -479,6 +479,114 @@ def test_exact_predictive_lead_calibration():
     print(f"  [PASS] Exact lead: t={t_lead:.4f}s, dist={flight_dist:.2f}m, error={abs(flight_dist - expected_dist):.2e}m")
 
 
+def test_mortar_ground_bounce_splash():
+    print("\n=== TEST 11: Mortar Splash Ground-Bouncing (Low Wall Terrain Bounce) ===")
+    from artillery import (
+        IndirectParabolicMortarSolver,
+        MORTAR_SPLASH_RADIUS,
+        MORTAR_SPLASH_DAMAGE,
+        ArtillerySystem
+    )
+    solver = IndirectParabolicMortarSolver()
+    my_pos = [0.0, 0.0, 0.0]
+    # Target ducking behind a low wall at [80, 0, 0]
+    ducking_target = [80.0, 0.0, 0.0]
+    
+    # 1. Ground-bounce trajectory targeting terrain 3.5m behind target
+    traj = solver.solve_ground_bounce_splash(my_pos, ducking_target, behind_offset=3.5)
+    assert traj is not None, "Failed to solve ground-bounce trajectory!"
+    assert traj.is_high_arc is True, "Must be high-arc to lob over low wall!"
+    
+    # 2. Verify ground impact point is strictly within the 7m splash zone
+    impact = traj.predicted_impact
+    impact_dist = math.hypot(impact[0] - ducking_target[0], impact[1] - ducking_target[1])
+    assert impact_dist <= MORTAR_SPLASH_RADIUS, f"Impact {impact_dist}m exceeds {MORTAR_SPLASH_RADIUS}m splash zone!"
+    assert abs(impact_dist - 3.5) < 1e-4
+    
+    # 3. Verify splash damage calculation: 160 falling to 30% at 7m
+    splash_dmg = solver.calculate_splash_damage(impact_dist)
+    expected_dmg = MORTAR_SPLASH_DAMAGE * (1.0 - 0.7 * (3.5 / MORTAR_SPLASH_RADIUS))
+    assert abs(splash_dmg - expected_dmg) < 1e-4, f"Splash damage mismatch: {splash_dmg} vs {expected_dmg}"
+    assert splash_dmg == 104.0
+    print(f"  [PASS] Ground-bounce impact={impact[0]:.1f}m ({impact_dist:.1f}m behind target <= {MORTAR_SPLASH_RADIUS}m splash zone).")
+    print(f"  [PASS] Splash damage={splash_dmg:.1f} dmg (falling to 30% at {MORTAR_SPLASH_RADIUS}m) + 16 m/s concussion.")
+    
+    # 4. Integrated ArtillerySystem combat tick with ducking_behind_wall=True
+    art = ArtillerySystem()
+    me = {
+        "pos": [0.0, 0.0, 0.0],
+        "aim": [0.0, 0.0],
+        "weapons": [
+            {"kind": "gun", "ammo": 12, "reload": 0.0, "cooldown": 0.0},
+            {"kind": "mortar", "cooldown": 0.0}
+        ]
+    }
+    target_mech = {"id": 7, "pos": [80.0, 0.0, 0.0], "hp": 500.0}
+    res = art.evaluate_combat_tick(
+        me, target=target_mech, has_los=False, pickups=[], ducking_behind_wall=True
+    )
+    assert res["fire"][1] is True, "Mortar must fire ground-bounce splash!"
+    assert res["tactical_move"] == "MORTAR_GROUND_BOUNCE_SPLASH"
+    print("  [PASS] Combat tick triggered MORTAR_GROUND_BOUNCE_SPLASH when target ducks behind low wall.")
+
+
+def test_lightning_chain_farming():
+    print("\n=== TEST 12: Lightning Chain Farming (Arc Jumping into Shielded Targets) ===")
+    from artillery import (
+        LightningChainFarming,
+        LIGHTNING_CHAIN_RANGE,
+        LIGHTNING_CHAIN_MULT,
+        LIGHTNING_DAMAGE,
+        ArtillerySystem
+    )
+    chain_engine = LightningChainFarming()
+    my_pos = [0.0, 0.0, 0.0]
+    aim_yaw = 0.0
+
+    # Group fight setup:
+    # - Shielded enemy at [35, 5, 0] (35.3m away)
+    # - Close crate at [22, 0, 0] (22.0m away, within 14m of shielded enemy: dist = 13.9m <= 14m)
+    # - Secondary wounded enemy at [26, -5, 0] (within 14m of crate: dist = 6.4m <= 14m)
+    group_enemies = [
+        {"id": 10, "kind": "mech", "hp": 1000.0, "shield": True, "pos": [35.0, 5.0, 0.0]},     # Shielded!
+        {"id": 11, "kind": "mech", "hp": 300.0, "shield": False, "pos": [26.0, -5.0, 0.0]},    # Unshielded
+    ]
+    group_crates = [
+        {"id": 1008, "kind": "crate", "hp": 300.0, "pos": [22.0, 0.0, 0.0]}                    # Proxy crate!
+    ]
+
+    # 1. Chain evaluation
+    res = chain_engine.evaluate_chain_farming(my_pos, aim_yaw, group_enemies, crates=group_crates)
+    assert res is not None, "Failed to evaluate lightning chain!"
+    # Must target the CLOSEST proxy (crate 1008 at 22m) to jump arcs into shielded target!
+    assert res.primary_target["id"] == 1008, f"Expected closest crate 1008, got {res.primary_target}"
+    assert res.jumps_to_shielded is True, "Must flag jumps_to_shielded as True!"
+    assert len(res.secondary_targets) == 2, f"Expected 2 chained secondaries, got {len(res.secondary_targets)}"
+    assert res.secondary_damages == [42.0, 42.0], f"Expected 0.7x damage (42.0), got {res.secondary_damages}"
+    assert res.total_damage == 144.0, f"Expected 60 + 42 + 42 = 144.0 damage, got {res.total_damage}"
+    print(f"  [PASS] Closest proxy target selected: Crate 1008 at 22m.")
+    print(f"  [PASS] Arc jumps into shielded Enemy 10 (42.0 dmg) + Enemy 11 (42.0 dmg).")
+    print(f"  [PASS] Total burst damage = {res.total_damage:.1f} (0.7x damage multiplier per chain jump).")
+
+    # 2. Combat tick integration
+    art = ArtillerySystem()
+    me = {
+        "pos": [0.0, 0.0, 0.0],
+        "aim": [0.0, 0.0],
+        "energy": 50.0,
+        "weapons": [
+            {"kind": "gun", "ammo": 12, "reload": 0.0, "cooldown": 0.0},
+            {"kind": "lightning", "cooldown": 0.0}
+        ]
+    }
+    comb_res = art.evaluate_combat_tick(
+        me, target=group_enemies[0], has_los=True, pickups=[], all_enemies=group_enemies, crates=group_crates
+    )
+    assert comb_res["fire"][1] is True, "Lightning must fire!"
+    assert comb_res["tactical_move"] == "LIGHTNING_CHAIN_FARMING"
+    print("  [PASS] Combat tick triggered LIGHTNING_CHAIN_FARMING in group fight.")
+
+
 def test_performance_budget():
     print("\n=== TEST 6: Performance Benchmark (< 1.5 ms execution budget) ===")
     artillery = ArtillerySystem()
@@ -562,6 +670,8 @@ if __name__ == "__main__":
     test_laser_lightning_combo()
     test_select_optimal_target_api()
     test_exact_predictive_lead_calibration()
+    test_mortar_ground_bounce_splash()
+    test_lightning_chain_farming()
     test_performance_budget()
     print("\n==================================================================")
     print("ALL TESTS PASSED WITH 100% SUCCESS!")

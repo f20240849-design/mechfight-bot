@@ -1,7 +1,8 @@
 """
 Disciplined Opportunist: Tournament-winning MechRoyale Bot.
-Implements the high-level brain, out-of-combat 45 HP/s resets, rear-armor protection,
-ballistic lead prediction, and supply-drop ambushes.
+Implements the high-level brain, evasion & projectile dodging, out-of-combat 45 HP/s resets,
+decoupled +/-70 deg rear-armor protection, radar vision sweeping, ballistic lead prediction,
+and ghost phase weapon rush.
 """
 import atexit
 import json
@@ -19,6 +20,7 @@ from artillery import ArtillerySystem
 from gatekeeper import ZoneGatekeeper, Chokepoint
 from rooftops import RooftopManager, RooftopEscapeTarget, is_on_rooftop
 from flank_orbit import FlankOrbitEngine
+from evasion import EvasionSystem
 
 class Bot:
     name = "opportunist-v1"
@@ -36,10 +38,13 @@ class Bot:
         self.gatekeeper = ZoneGatekeeper(map_dir)
         self.rooftops = RooftopManager(map_dir)
         self.flank_orbit = FlankOrbitEngine(map_dir)
+        self.evasion = EvasionSystem()
 
         # Tactical memory
         self.seen_enemies: Dict[int, Dict[str, Any]] = {}
         self.last_damaged_time = -100.0
+        self.last_damaged_bearing: Optional[float] = None
+        self.last_damaged_rear = False
         self.last_attack_time = -100.0
         self.current_waypoints: List[Tuple[float, float]] = []
         self.cached_nav_target: Optional[Tuple[float, float]] = None
@@ -47,22 +52,27 @@ class Bot:
         self.gatekeep_aim_yaw = 0.0
         self.active_escape: Optional[RooftopEscapeTarget] = None
 
+        # Vision Radar Sweep State (Decoupled 360-deg FOV Refresh)
+        self.last_sweep_time = 0.0
+        self.sweep_stage = 0  # 0: normal, 1: flick +120 deg, 2: flick -120 deg
+        self.sweep_ticks = 0
+
         # Complete upgrade priority ranking (all 22 upgrades from config)
         self.upgrade_ranks = {
             "nanites": 100,             # +60% out-of-combat regen, starts 1.5s sooner (powers combat resets!)
-            "armor": 92,                # -8% damage taken (multiplicative effective HP)
-            "plating": 88,              # +15% max HP
+            "armor": 95,                # -8% damage taken (multiplicative effective HP)
+            "plating": 90,              # +15% max HP
             "servos": 85,               # +8% speed (boosts transverse strafe dodging vs naive bots)
             "gun_mag": 80,              # +8 rounds, -20% reload time (less reload vulnerability)
-            "gun_rate": 76,             # +15% arm gun fire rate
-            "gun_damage": 72,           # +15% arm gun damage
-            "gun_velocity": 70,         # +25% arm gun projectile speed (even easier to lead)
-            "laser_charge": 68,         # -25% laser charge time
-            "laser_damage": 65,         # +18% laser damage
-            "laser_pierce": 63,         # laser passes through one more target
-            "lightning_range": 60,      # +20% lightning range and cone
-            "lightning_efficiency": 58, # -35% lightning energy cost, +10% damage
-            "lightning_chain": 55,      # +1 lightning chain jump
+            "laser_damage": 78,         # +18% laser damage
+            "laser_charge": 76,         # -25% laser charge time
+            "gun_rate": 72,             # +15% arm gun fire rate
+            "gun_damage": 70,           # +15% arm gun damage
+            "laser_pierce": 66,         # laser passes through one more target
+            "lightning_efficiency": 62, # -35% lightning energy cost, +10% damage
+            "gun_velocity": 60,         # +25% arm gun projectile speed
+            "lightning_range": 58,      # +20% lightning range and cone
+            "lightning_chain": 54,      # +1 lightning chain jump
             "reactor": 50,              # +30% energy regen
             "sensors": 45,              # +15m proximity sensors, +25m vision
             "jets": 40,                 # -25% boost & jet drain
@@ -108,6 +118,9 @@ class Bot:
             if ev_type == "damaged":
                 self.last_damaged_time = t
                 self.telemetry["damage_taken"] += ev.get("amount", 0)
+                if ev.get("bearing") is not None:
+                    self.last_damaged_bearing = ev["bearing"]
+                self.last_damaged_rear = ev.get("rear", False)
             elif ev_type == "hit":
                 self.last_attack_time = t
                 self.telemetry["damage_dealt"] += ev.get("amount", 0)
@@ -146,6 +159,20 @@ class Bot:
         """Delegates to SmartWeaponSwapManager from artillery system."""
         return self.artillery.swap_manager.evaluate_swap(me, pickups, enemies, t)
 
+    def compute_defensive_facing(self, threat_bearing: float, move_yaw: float) -> float:
+        """
+        The Claude +/-70 deg Defensive Facing Rule:
+        b = bearing to primary threat
+        v = travel direction
+        aim = b + clamp(wrap(v - b), -70 deg, +70 deg)
+        Ensures threat is ALWAYS inside front 180 deg arc (at most 70 deg off center),
+        guaranteeing ZERO rear-armor multiplier, while keeping travel path directly
+        inside the 120 deg vision wedge!
+        """
+        diff = math.atan2(math.sin(move_yaw - threat_bearing), math.cos(move_yaw - threat_bearing))
+        clamped = max(-1.2217, min(1.2217, diff))  # 70 degrees = 1.2217 rad
+        return threat_bearing + clamped
+
     def act(self, obs: mf.Observation) -> mf.Action:
         me = obs["self"]
         x, y, z = me["pos"]
@@ -161,7 +188,13 @@ class Bot:
         if obs.get("offer"):
             action["pick"] = self._choose_upgrade(obs["offer"])
 
-        # 2. Handle weapon pickups
+        # 2. Evaluate incoming projectile & beam evasion
+        evasion_res = self.evasion.evaluate(me, obs)
+        is_threatened = evasion_res["threat_level"] > 0.20
+        should_jump = evasion_res["should_jump"] and me.get("grounded", False)
+        evasion_boost = evasion_res["should_boost"]
+
+        # 3. Handle weapon pickups & inventory
         visible_enemies = [m for m in obs.get("mechs", []) if m.get("kind") == "mech"]
         visible_enemies.sort(key=lambda m: math.hypot(m["pos"][0] - x, m["pos"][1] - y))
 
@@ -169,11 +202,11 @@ class Bot:
         if loot_action:
             action.update(loot_action)
 
-        # 3. Assess threats & combat status
+        # 4. Assess threats & combat status
         time_since_combat = t - max(self.last_damaged_time, self.last_attack_time)
         in_combat_reset = time_since_combat >= 5.0  # 45 HP/s active healing!
 
-        # Use BALLIS Dynamic Target Scorer (selects lowest HP / rear-armor targets or early NPCs)
+        # Target selection: BALLIS Dynamic Target Scorer
         optimal_target = self.artillery.select_optimal_target([x, y, z], obs.get("mechs", []), t)
         closest_enemy = optimal_target if optimal_target else (visible_enemies[0] if visible_enemies else None)
         
@@ -186,7 +219,7 @@ class Bot:
 
         enemy_dist = math.hypot(closest_enemy["pos"][0] - x, closest_enemy["pos"][1] - y) if closest_enemy else 1e9
 
-        # 4. High-Level Decision Engine (Disciplined Opportunist & Zone Gatekeeper)
+        # High-Level Decision Engine & Macro Navigation
         zone = obs["zone"]
         zone_center = zone.get("next_center", zone.get("center", [0, 0]))
         next_radius = zone.get("next_radius", zone.get("radius", 380))
@@ -197,13 +230,16 @@ class Bot:
         # Default movement & aim targets
         nav_target: Tuple[float, float] = (zone_center[0], zone_center[1])
         torso_aim: Tuple[float, float] = (0.0, 0.0)
-        should_boost = False
+        should_boost = evasion_boost
         should_fire = [False, False]
+        should_reload = False
 
-        # 0. Check Inventory & Weapons Status
+        # Inventory check
         w1 = me["weapons"][1]
         w0 = me["weapons"][0]
         holds_laser = (w1 and w1.get("kind") == "laser") or (w0 and w0.get("kind") == "laser")
+        holds_lightning = (w1 and w1.get("kind") == "lightning") or (w0 and w0.get("kind") == "lightning")
+        holds_mortar = (w1 and w1.get("kind") == "mortar") or (w0 and w0.get("kind") == "mortar")
         holds_secondary = w1 is not None
 
         floor_weapons = [p for p in obs.get("pickups", []) if p.get("kind") in ("laser", "lightning", "mortar")]
@@ -213,29 +249,37 @@ class Bot:
         has_enemy_los = False
         enemy_is_charging = False
         enemy_holds_laser = False
+        enemy_holds_mortar = False
+        enemy_holds_lightning = False
         if closest_enemy:
             has_enemy_los = self.nav.has_los(x, y, closest_enemy["pos"][0], closest_enemy["pos"][1])
             enemy_is_charging = closest_enemy.get("charging", False)
             enemy_weapons = closest_enemy.get("weapons", [])
             enemy_holds_laser = "laser" in enemy_weapons
+            enemy_holds_mortar = "mortar" in enemy_weapons
+            enemy_holds_lightning = "lightning" in enemy_weapons
 
-        # 0. Check Zone Urgency & Gas Status
+        # Zone urgency
         is_outside = not me.get("in_zone", True)
         needs_zone_rotation, eta_seconds = self.gatekeeper.evaluate_rotation_urgency(
             (x, y), zone, my_speed=11.7, current_time=t
         )
         shrink_imminent = (eta_seconds > max(1.0, shrink_start - t)) or (shrink_start - t < 15.0 and dist_to_next_center > next_radius - 20.0)
 
-        # 0. Check Rooftop Verticality Status
+        # Rooftop status
         current_roof = self.rooftops.is_on_rooftop([x, y, z])
         energy = float(me.get("energy", 100.0))
+
+        # Check for reload opportunity: if gun has < 5 ammo and no immediate close combat, reload now!
+        if w0 and w0.get("ammo", 12) <= 4 and w0.get("reload", 0) == 0:
+            if not closest_enemy or not has_enemy_los or enemy_dist > 35.0:
+                should_reload = True
 
         # =========================================================================
         # UNIFIED STRATEGIC HIERARCHY (Strictly Mutually Exclusive Priorities)
         # =========================================================================
 
         # Priority 0: Zone Survival (Storm / Gas Escape)
-        # If in storm (is_outside) or rotation is urgent: MUST get to safe zone.
         if is_outside or needs_zone_rotation or shrink_imminent:
             if current_roof:
                 exit_info = self.rooftops.get_safe_exit_vector(
@@ -255,32 +299,47 @@ class Bot:
 
         # Priority 1: Critical Combat Reset / Cover Retreat
         # Triggered if:
-        # a) Low HP (< 500)
+        # a) Low HP (< 550)
         # b) Enemy is charging Laser with direct LOS and we don't have Laser
-        # c) Enemy holds Laser at long range (> 65m) while we only have Gun
-        elif closest_enemy and (
-            my_hp < 500.0
+        # c) Enemy holds Laser at range (> 50m) while we only have Gun
+        # d) Ghost Phase (t < 30s) encounter at > 60m without Laser: NEVER duel in the open!
+        # e) TTK inequality test indicates negative expected value
+        elif (closest_enemy and (
+            my_hp < 550.0
             or (enemy_is_charging and has_enemy_los and not holds_laser)
-            or (enemy_holds_laser and enemy_dist > 65.0 and not holds_laser and has_enemy_los)
-        ):
+            or (enemy_holds_laser and enemy_dist > 50.0 and not holds_laser and has_enemy_los)
+            or (t < 30.0 and enemy_dist > 50.0 and not holds_laser)
+        )) or (t - self.last_damaged_time < 1.5 and my_hp < 650.0):
             self.active_state = "COMBAT_RESET"
-            cover = self.nav.find_cover_spot((x, y), (closest_enemy["pos"][0], closest_enemy["pos"][1]))
+            threat_pos = (closest_enemy["pos"][0], closest_enemy["pos"][1]) if closest_enemy else (
+                (x - math.cos(self.last_damaged_bearing or 0.0) * 50.0, y - math.sin(self.last_damaged_bearing or 0.0) * 50.0)
+            )
+            cover = self.nav.find_cover_spot((x, y), threat_pos)
             if cover:
                 nav_target = cover
             else:
-                kmove = self.combat.compute_kiting_move([x, y], closest_enemy["pos"], None, tick)
+                kmove = self.combat.compute_kiting_move([x, y], list(threat_pos), None, tick, nav=self.nav)
                 nav_target = (x + kmove[0] * 25.0, y + kmove[1] * 25.0)
             should_boost = True
 
-        # Priority 2: Empty Weapon Slot 1 - Immediate Weapon Rush!
-        # If we have no secondary weapon and a high-tier weapon is nearby (< 90m): grab it!
-        elif not holds_secondary and floor_weapons and (
-            best_wp := min(floor_weapons, key=lambda p: math.hypot(p["pos"][0] - x, p["pos"][1] - y))
-        ) and math.hypot(best_wp["pos"][0] - x, best_wp["pos"][1] - y) < 90.0:
-            self.active_state = "WEAPON_RUSH"
-            nav_target = (best_wp["pos"][0], best_wp["pos"][1])
+        # Priority 2: Ghost Phase & Weapon Rush (Opening 0-30s or Empty Slot 1)
+        # In early game, securing a Laser/Lightning weapon is the single highest expected value move
+        # RULE: Walk at 11.7 m/s, NEVER boost to travel (avoids 90m acoustic alert)
+        elif (t < 30.0 or not holds_secondary) and floor_weapons:
+            # Prefer Laser > Lightning > Mortar
+            def wp_priority(p):
+                k = p.get("kind")
+                d = math.hypot(p["pos"][0] - x, p["pos"][1] - y)
+                tier = 0 if k == "laser" else (1 if k == "lightning" else 2)
+                return (tier, d)
+
+            best_wp = min(floor_weapons, key=wp_priority)
             wp_dist = math.hypot(best_wp["pos"][0] - x, best_wp["pos"][1] - y)
-            should_boost = wp_dist > 15.0
+            if wp_dist < 160.0:
+                self.active_state = "WEAPON_RUSH"
+                nav_target = (best_wp["pos"][0], best_wp["pos"][1])
+                # Walk at 11.7 m/s to stay quiet (footstep 40m vs boost 90m sound!)
+                should_boost = False
 
         # Priority 3: Rooftop Perch Healing (if on roof and safe)
         elif current_roof:
@@ -300,26 +359,64 @@ class Bot:
                     nav_target = cover
 
         # Priority 5: Tactical Combat Engagement (within viable combat range)
-        # Viable range: <= 65m for Arm Gun, or <= 160m if we hold a Laser!
-        elif closest_enemy and (enemy_dist <= 65.0 or (holds_laser and enemy_dist <= 160.0)):
-            self.active_state = "ENGAGE"
-            combat_move = self.combat.compute_combat_move([x, y], closest_enemy["pos"], tick)
-            c_target = (x + combat_move[0] * 25.0, y + combat_move[1] * 25.0)
-            if not self.nav.is_walkable(c_target[0], c_target[1]):
-                combat_move_alt = [-combat_move[1], combat_move[0]]
-                alt_target = (x + combat_move_alt[0] * 25.0, y + combat_move_alt[1] * 25.0)
-                if self.nav.is_walkable(alt_target[0], alt_target[1]):
-                    c_target = alt_target
-            nav_target = c_target
-            should_boost = enemy_dist < 30.0
+        # Apply Claude TTK Disengage vs Commit Inequality:
+        # Commit only if: e / D_us < 0.75 * h / D_them OR e <= 315 (One-shot laser kill!)
+        elif closest_enemy and (
+            (holds_laser and enemy_dist <= 160.0)
+            or (holds_lightning and enemy_dist <= 45.0)
+            or (enemy_dist <= 65.0 and not enemy_holds_laser)
+            or (enemy_dist <= 35.0)
+        ):
+            # Calculate TTK
+            d_us = 131.0 if holds_laser else (240.0 if holds_lightning else 102.0)
+            if holds_laser and enemy_holds_mortar:
+                d_us *= 1.6  # Cookoff
+            d_them = 131.0 if enemy_holds_laser else (240.0 if enemy_holds_lightning else 102.0)
+            enemy_e_hp = closest_enemy.get("hp", 1000.0)
+            
+            ttk_them = enemy_e_hp / max(d_us, 1.0)
+            ttk_us = my_hp / max(d_them, 1.0)
 
-        # Priority 6: Supply Drop Interception (if no close enemy threat)
+            # One-shot rule: If we hold laser and e <= 315 with LOS, ALWAYS COMMIT!
+            is_one_shot = holds_laser and enemy_e_hp <= 315.0 and has_enemy_los
+
+            if is_one_shot or (ttk_them <= 0.75 * ttk_us) or (enemy_dist < 25.0):
+                self.active_state = "ENGAGE"
+                combat_move = self.combat.compute_combat_move([x, y], closest_enemy["pos"], tick, nav=self.nav)
+                c_target = (x + combat_move[0] * 25.0, y + combat_move[1] * 25.0)
+                if not self.nav.is_walkable(c_target[0], c_target[1]):
+                    combat_move_alt = [-combat_move[1], combat_move[0]]
+                    alt_target = (x + combat_move_alt[0] * 25.0, y + combat_move_alt[1] * 25.0)
+                    if self.nav.is_walkable(alt_target[0], alt_target[1]):
+                        c_target = alt_target
+                nav_target = c_target
+                should_boost = enemy_dist < 30.0 or holds_lightning
+            else:
+                # Disadvantageous duel: disengage into cover!
+                self.active_state = "COMBAT_RESET"
+                cover = self.nav.find_cover_spot((x, y), (closest_enemy["pos"][0], closest_enemy["pos"][1]))
+                if cover:
+                    nav_target = cover
+                else:
+                    kmove = self.combat.compute_kiting_move([x, y], closest_enemy["pos"], None, tick, nav=self.nav)
+                    nav_target = (x + kmove[0] * 25.0, y + kmove[1] * 25.0)
+                should_boost = True
+
+        # Priority 6: Supply Drop Vulture Strategy
+        # Drop 1 & 2 (t < 180s): Approach to 80-120m in cover; don't step into the ring killzone!
+        # Drop 3 (t >= 180s): Aggressively contest or snatch
         elif obs.get("drops") and (
             drop_target := self.gatekeeper.evaluate_drop_objective((x, y), obs.get("drops", []), visible_enemies, t)
         ) is not None:
-            self.active_state = "DROP_CAPTURE"
-            nav_target = drop_target
-            should_boost = math.hypot(drop_target[0] - x, drop_target[1] - y) > 15.0
+            if t < 180.0 and visible_enemies and math.hypot(drop_target[0] - x, drop_target[1] - y) < 40.0:
+                # Vulture hold: observe from cover at 70m
+                cover = self.nav.find_cover_spot((x, y), drop_target, min_dist=50.0, max_dist=80.0)
+                nav_target = cover if cover else drop_target
+                self.active_state = "DROP_VULTURE"
+            else:
+                self.active_state = "DROP_CAPTURE"
+                nav_target = drop_target
+                should_boost = math.hypot(drop_target[0] - x, drop_target[1] - y) > 15.0
 
         # Priority 7: Safe Farm & Flank Orbit (Loot, Crates, Perimeter)
         else:
@@ -330,12 +427,12 @@ class Bot:
             if not holds_secondary and floor_weapons:
                 floor_weapons.sort(key=lambda p: math.hypot(p["pos"][0] - x, p["pos"][1] - y))
                 nav_target = (floor_weapons[0]["pos"][0], floor_weapons[0]["pos"][1])
-                should_boost = math.hypot(floor_weapons[0]["pos"][0] - x, floor_weapons[0]["pos"][1] - y) > 15.0
+                should_boost = False
             # 2. Loose power cubes within 50m
             elif cubes and math.hypot(cubes[0]["pos"][0] - x, cubes[0]["pos"][1] - y) < 50.0:
                 cubes.sort(key=lambda c: math.hypot(c["pos"][0] - x, c["pos"][1] - y))
                 nav_target = (cubes[0]["pos"][0], cubes[0]["pos"][1])
-                should_boost = math.hypot(cubes[0]["pos"][0] - x, cubes[0]["pos"][1] - y) > 20.0
+                should_boost = False
             # 3. Third-party recent kill
             elif death_pos and math.hypot(death_pos[0] - x, death_pos[1] - y) < 80.0:
                 self.active_state = "THIRD_PARTY_AMBUSH"
@@ -391,20 +488,12 @@ class Bot:
         elif art_res.get("aim") and closest_enemy:
             torso_aim = (art_res["aim"][0], art_res["aim"][1])
 
-        # Gun trigger discipline: only fire at enemy if aim yaw is reasonably aligned (< 0.22 rad / 12.6 deg)!
+        # Gun trigger discipline: only fire at enemy if aim yaw is reasonably aligned (< 0.20 rad)!
         if closest_enemy:
             curr_yaw = me.get("aim", [0.0, 0.0])[0]
             yaw_err = abs(math.atan2(math.sin(torso_aim[0] - curr_yaw), math.cos(torso_aim[0] - curr_yaw)))
-            if yaw_err > 0.22 and not (me["weapons"][1] and me["weapons"][1].get("kind") == "mortar"):
+            if yaw_err > 0.20 and not (me["weapons"][1] and me["weapons"][1].get("kind") == "mortar"):
                 should_fire[0] = False
-
-        # If in combat reset or rooftop escape/perch, aim at enemy to protect rear armor, and cease fire once LOS is broken!
-        if self.active_state in ("COMBAT_RESET", "ROOFTOP_ESCAPE", "ROOFTOP_PERCH") and closest_enemy:
-            dx = closest_enemy["pos"][0] - x
-            dy = closest_enemy["pos"][1] - y
-            torso_aim = (math.atan2(dy, dx), 0.0)
-            if not has_enemy_los and not (me["weapons"][1] and me["weapons"][1].get("kind") == "mortar"):
-                should_fire = [False, False]
 
         # 6. Motion Planning (Waypoints via A* with caching)
         target_dist_from_cached = (
@@ -412,11 +501,9 @@ class Bot:
             if hasattr(self, "cached_nav_target") and self.cached_nav_target
             else 999.0
         )
-        # Advance current waypoints if we are close to the next one
         while self.current_waypoints and math.hypot(self.current_waypoints[0][0] - x, self.current_waypoints[0][1] - y) < 4.0:
             self.current_waypoints.pop(0)
 
-        # Re-plan if target changed significantly (>6m), waypoints empty, or lost line-of-sight to next waypoint
         needs_replan = (
             not self.current_waypoints
             or target_dist_from_cached > 6.0
@@ -435,8 +522,18 @@ class Bot:
             move_yaw = math.atan2(nav_target[1] - y, nav_target[0] - x)
             move_vec = [math.cos(move_yaw), math.sin(move_yaw)]
 
+        # 7. Dynamic Evasion Vector Integration
+        if is_threatened and evasion_res["dodge_vec"]:
+            d_vec = evasion_res["dodge_vec"]
+            if self.nav.is_walkable(x + d_vec[0] * 3.0, y + d_vec[1] * 3.0):
+                move_vec = [d_vec[0] * 0.85 + move_vec[0] * 0.15, d_vec[1] * 0.85 + move_vec[1] * 0.15]
+                mlen = math.hypot(move_vec[0], move_vec[1])
+                if mlen > 0.01:
+                    move_vec = [move_vec[0] / mlen, move_vec[1] / mlen]
+                should_boost = True
+
         # Steer away from active sound clusters during exploration
-        if self.active_state in ("SAFE_FARM", "ZONE_ROTATION") and not closest_enemy:
+        if self.active_state in ("SAFE_FARM", "ZONE_ROTATION") and not closest_enemy and not is_threatened:
             rep_x, rep_y = self.radar.get_danger_vector([x, y])
             if (rep_x, rep_y) != (0.0, 0.0):
                 move_vec = [move_vec[0] * 0.75 + rep_x * 0.25, move_vec[1] * 0.75 + rep_y * 0.25]
@@ -444,21 +541,78 @@ class Bot:
                 if mlen > 0.01:
                     move_vec = [move_vec[0] / mlen, move_vec[1] / mlen]
 
-        # If in GATEKEEP_AMBUSH, hold aim down the alley; otherwise look in direction of movement
-        if self.active_state == "GATEKEEP_AMBUSH" and (not closest_enemy or not has_enemy_los):
+        # =========================================================================
+        # 8. Decoupled Facing & Vision Sweep Policy (Sections 2 & 6)
+        # =========================================================================
+        # If in retreat or kiting, execute the Claude +/-70 deg defensive facing rule:
+        # Protects front-arc 180 deg armor while keeping travel path in 120 deg vision wedge!
+        if self.active_state in ("COMBAT_RESET", "ROOFTOP_EXIT", "ROOFTOP_ESCAPE") and closest_enemy:
+            threat_yaw = math.atan2(closest_enemy["pos"][1] - y, closest_enemy["pos"][0] - x)
+            defensive_aim_yaw = self.compute_defensive_facing(threat_yaw, move_yaw)
+            torso_aim = (defensive_aim_yaw, 0.0)
+            if not has_enemy_los and not (me["weapons"][1] and me["weapons"][1].get("kind") == "mortar"):
+                should_fire = [False, False]
+
+        elif (not closest_enemy or not has_enemy_los) and t - self.last_damaged_time < 1.5:
+            # Turn to face recent unseen damage bearing
+            if self.last_damaged_bearing is not None:
+                defensive_aim_yaw = self.compute_defensive_facing(self.last_damaged_bearing, move_yaw)
+                torso_aim = (defensive_aim_yaw, 0.0)
+
+        elif self.active_state == "GATEKEEP_AMBUSH" and (not closest_enemy or not has_enemy_los):
             torso_aim = (self.gatekeep_aim_yaw, 0.0)
+
         elif (not closest_enemy or not has_enemy_los) and not (should_fire[0] or should_fire[1]):
-            torso_aim = (move_yaw, 0.0)
+            # Vision Radar Sweep (Section 6):
+            # Every 3.5s, flick +120 deg (2 ticks) then -120 deg (2 ticks) to refresh
+            # all enemies within 200m inside the 5.0s tracking memory!
+            if t - self.last_sweep_time > 3.5:
+                self.sweep_stage = 1
+                self.sweep_ticks = 0
+                self.last_sweep_time = t
+
+            if self.sweep_stage == 1:
+                # Flick right (+120 deg)
+                torso_aim = (move_yaw + 2.0944, 0.0)
+                self.sweep_ticks += 1
+                if self.sweep_ticks >= 2:
+                    self.sweep_stage = 2
+                    self.sweep_ticks = 0
+            elif self.sweep_stage == 2:
+                # Flick left (-120 deg)
+                torso_aim = (move_yaw - 2.0944, 0.0)
+                self.sweep_ticks += 1
+                if self.sweep_ticks >= 2:
+                    self.sweep_stage = 0
+                    self.sweep_ticks = 0
+            else:
+                torso_aim = (move_yaw, 0.0)
+
+        # Energy Reserve Invariant Guard:
+        # Energy must never drop below 15.0 unless actively evading mortar splash!
+        is_dodging_mortar = is_threatened and (evasion_res.get("source") == "mortar")
+        if not is_dodging_mortar:
+            if energy < 16.7:
+                should_boost = False
+            if energy < 15.0:
+                should_jump = False
+            if holds_lightning and energy < 18.0:
+                if me["weapons"][1] and me["weapons"][1].get("kind") == "lightning":
+                    should_fire[1] = False
+                elif me["weapons"][0] and me["weapons"][0].get("kind") == "lightning":
+                    should_fire[0] = False
 
         action.update(
             move=move_vec,
             aim=[torso_aim[0], torso_aim[1]],
             boost=should_boost,
-            fire=should_fire
+            jump=should_jump,
+            fire=should_fire,
+            reload=should_reload
         )
 
         # Debug Visualizations
-        mf.draw.label(f"{self.active_state} | HP {my_hp:.0f} | {'REGEN' if in_combat_reset else 'COMBAT'}")
+        mf.draw.label(f"{self.active_state} | HP {my_hp:.0f} | {'DODGE' if is_threatened else ('REGEN' if in_combat_reset else 'COMBAT')}")
         if closest_enemy and has_enemy_los:
             mf.draw.line([x, y, z + 7], [closest_enemy["pos"][0], closest_enemy["pos"][1], closest_enemy["pos"][2] + 4.5], "#ff3333")
         mf.draw.point([nav_target[0], nav_target[1], z], "#33ff88", 6)

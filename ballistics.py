@@ -1,7 +1,7 @@
 """
 Ballistics, Targeting, and Weapon Controllers for MechRoyale.
-Handles lead prediction, laser charge/release cycle, lightning cone, and mortar trajectory.
-Integrated with BALLIS artillery systems.
+Handles predictive lead calculation (2-pass convergence), hitscan laser targeting,
+lightning cone triggers, and ballistic mortar artillery arcs.
 """
 import math
 from typing import Dict, List, Optional, Tuple, Any
@@ -66,7 +66,8 @@ class Ballistics:
         target_height_offset: float = 4.5
     ) -> Tuple[float, float, float]:
         """
-        Solves first-order predictive aim for a projectile with constant velocity.
+        Solves multi-iteration predictive aim for a projectile with constant speed.
+        Refines time-of-flight estimation over 2 passes for high accuracy.
         Returns: (yaw, pitch, flight_time)
         """
         sx, sy, sz = my_pos[0], my_pos[1], my_pos[2] + self.muzzle_height
@@ -79,10 +80,18 @@ class Ballistics:
         dist = math.hypot(dx, dy, dz)
 
         t_flight = dist / max(bullet_speed, 1.0)
-        # 1-iteration refinement
-        pred_x = tx + vx * t_flight
-        pred_y = ty + vy * t_flight
-        pred_z = tz + vz * t_flight
+
+        # 2-iteration refinement
+        for _ in range(2):
+            pred_x = tx + vx * t_flight
+            pred_y = ty + vy * t_flight
+            pred_z = tz + vz * t_flight
+
+            pdx = pred_x - sx
+            pdy = pred_y - sy
+            pdz = pred_z - sz
+            dist = math.hypot(pdx, pdy, pdz)
+            t_flight = dist / max(bullet_speed, 1.0)
 
         pdx = pred_x - sx
         pdy = pred_y - sy
@@ -98,6 +107,27 @@ class Ballistics:
     def compute_laser_aim(self, my_pos: List[float], target_pos: List[float]) -> Tuple[float, float]:
         """Laser is hitscan: aim directly at target center of mass."""
         return self.laser_controller.compute_aim(my_pos, target_pos)
+
+    def is_aim_aligned(
+        self,
+        current_aim: List[float],
+        desired_aim: Tuple[float, float],
+        max_yaw_err: float = 0.18,
+        max_pitch_err: float = 0.25
+    ) -> bool:
+        """
+        Checks whether the torso has slewed sufficiently close to the desired firing angle.
+        Prevents wasting ammunition or mistiming lasers during rapid torso turns.
+        """
+        curr_yaw = current_aim[0]
+        curr_pitch = current_aim[1] if len(current_aim) > 1 else 0.0
+
+        des_yaw, des_pitch = desired_aim[0], desired_aim[1]
+
+        yaw_diff = abs(math.atan2(math.sin(des_yaw - curr_yaw), math.cos(des_yaw - curr_yaw)))
+        pitch_diff = abs(des_pitch - curr_pitch)
+
+        return yaw_diff <= max_yaw_err and pitch_diff <= max_pitch_err
 
     def compute_mortar_aim(self, my_pos: List[float], target_pos: List[float]) -> Optional[Tuple[float, float]]:
         """Solves low-arc ballistic arc for mortar."""
@@ -138,8 +168,6 @@ class Ballistics:
             self.laser_charge_ticks = 0
             return fire
 
-        t_pos = target.get("pos", [0, 0, 0]) if target else [0, 0, 0]
-
         # Iterate over our 2 weapon slots
         for slot_idx, w in enumerate(obs_weapons):
             if w is None:
@@ -175,7 +203,7 @@ class Ballistics:
             elif kind == "gun":
                 ammo = w.get("ammo", 0)
                 reload_time = w.get("reload", 0.0)
-                if has_los and ammo > 0 and reload_time == 0.0 and cooldown <= 0.05:
+                if has_los and ammo > 0 and reload_time == 0.0 and cooldown <= 0.05 and target_dist <= 65.0:
                     fire[slot_idx] = True
 
             elif kind == "mortar":
