@@ -78,6 +78,296 @@ class Chokepoint:
         )
 
 
+class SoundCluster:
+    """Represents a localized hot conflict zone / sound cluster."""
+    def __init__(self, cx: float, cy: float, initial_weight: float, first_time: float, kind: str):
+        self.cx = float(cx)
+        self.cy = float(cy)
+        self.total_weight = float(initial_weight)
+        self.death_count = 1 if kind == "death" else 0
+        self.explosion_count = 1 if kind in ("explosion", "mortar") else 0
+        self.sound_count = 1
+        self.last_time = float(first_time)
+        self.radius = 45.0  # Conflict zone spread radius
+
+    def add_event(self, x: float, y: float, weight: float, event_time: float, kind: str):
+        total_w = self.total_weight + weight
+        self.cx = (self.cx * self.total_weight + x * weight) / total_w
+        self.cy = (self.cy * self.total_weight + y * weight) / total_w
+        self.total_weight = total_w
+        if kind == "death":
+            self.death_count += 1
+        elif kind in ("explosion", "mortar"):
+            self.explosion_count += 1
+        self.sound_count += 1
+        if event_time > self.last_time:
+            self.last_time = event_time
+
+    def is_active(self, current_time: float, max_age: float = 7.0) -> bool:
+        """A cluster is actively dangerous if recent sounds occurred within max_age."""
+        return (current_time - self.last_time) <= max_age and (
+            self.death_count >= 1 or self.explosion_count >= 1 or self.total_weight >= 3.0
+        )
+
+
+class SoundClusterDeflector:
+    """
+    Sound Cluster Deflection Engine:
+    Triangulates death sounds (600m carry distance) and explosion sounds (420m)
+    to identify active conflict clusters, and defers or deflects macro zone rotations
+    so our bot waits for bot clusters to eliminate each other before rotating in.
+    """
+
+    # Official acoustic carry ranges from protocol.md
+    CARRY_RANGES: Dict[str, float] = {
+        "death": 600.0,
+        "explosion": 420.0,
+        "mortar": 420.0,
+        "laser": 380.0,
+        "gun": 320.0,
+        "crate": 220.0,
+        "npc_gun": 200.0,
+        "lightning": 160.0,
+        "laser_charge": 140.0,
+        "jet": 90.0,
+        "boost": 90.0,
+        "reload": 60.0,
+        "step": 40.0,
+        "drop": 600.0
+    }
+
+    def __init__(self, gatekeeper: Optional[Any] = None):
+        self.gatekeeper = gatekeeper
+        self.clusters: List[SoundCluster] = []
+
+    def update_acoustics(
+        self,
+        sounds: List[Dict[str, Any]],
+        my_pos: Tuple[float, float],
+        current_time: float
+    ):
+        """
+        Ingests heard sounds, triangulates source positions (death 600m, explosion 420m),
+        and clusters conflict zones.
+        """
+        my_x, my_y = float(my_pos[0]), float(my_pos[1])
+
+        for s in sounds:
+            kind = s.get("kind", "")
+            bearing = float(s.get("bearing", 0.0))
+            dist_cat = s.get("dist", "mid")
+            age = float(s.get("age", 0.0))
+            event_time = current_time - age
+
+            # Estimate distance from protocol carry range and categorical bin
+            carry_range = self.CARRY_RANGES.get(kind, 320.0)
+            if dist_cat == "near":
+                est_dist = 35.0
+            elif dist_cat == "mid":
+                est_dist = 110.0
+            else:  # "far"
+                est_dist = (160.0 + carry_range) * 0.5
+
+            sx = my_x + est_dist * math.cos(bearing)
+            sy = my_y + est_dist * math.sin(bearing)
+
+            # Assign weight: death and explosions are critical lethality signals
+            if kind == "death":
+                weight = 3.5
+            elif kind in ("explosion", "mortar"):
+                weight = 2.5
+            elif kind == "laser":
+                weight = 1.5
+            elif kind in ("gun", "lightning"):
+                weight = 1.0
+            else:
+                weight = 0.5
+
+            # Merge into existing nearby cluster (within 55m) or create new one
+            merged = False
+            for cl in self.clusters:
+                d = math.hypot(cl.cx - sx, cl.cy - sy)
+                if d <= 55.0:
+                    cl.add_event(sx, sy, weight, event_time, kind)
+                    merged = True
+                    break
+
+            if not merged:
+                new_cl = SoundCluster(sx, sy, weight, event_time, kind)
+                self.clusters.append(new_cl)
+
+        # Prune inactive clusters older than 8.0s
+        self.clusters = [cl for cl in self.clusters if (current_time - cl.last_time) <= 8.0]
+
+    def get_active_clusters(self, current_time: float) -> List[SoundCluster]:
+        """Returns all currently active conflict clusters with lethal activity."""
+        return [cl for cl in self.clusters if cl.is_active(current_time)]
+
+    def is_target_compromised(
+        self,
+        target_pos: Tuple[float, float],
+        current_time: float,
+        safe_margin: float = 75.0
+    ) -> Tuple[bool, Optional[SoundCluster]]:
+        """
+        Checks if a target waypoint is in the danger zone of an active sound cluster.
+        """
+        active = self.get_active_clusters(current_time)
+        tx, ty = target_pos[0], target_pos[1]
+        for cl in active:
+            if math.hypot(cl.cx - tx, cl.cy - ty) <= safe_margin:
+                return True, cl
+        return False, None
+
+    def is_path_compromised(
+        self,
+        start_pos: Tuple[float, float],
+        goal_pos: Tuple[float, float],
+        current_time: float,
+        corridor_width: float = 50.0
+    ) -> Tuple[bool, Optional[SoundCluster]]:
+        """
+        Checks if traversing from start_pos to goal_pos cuts through an active sound cluster.
+        """
+        active = self.get_active_clusters(current_time)
+        if not active:
+            return False, None
+
+        sx, sy = start_pos[0], start_pos[1]
+        gx, gy = goal_pos[0], goal_pos[1]
+        dx = gx - sx
+        dy = gy - sy
+        seg_len_sq = dx * dx + dy * dy
+
+        for cl in active:
+            if seg_len_sq < 1e-4:
+                dist = math.hypot(sx - cl.cx, sy - cl.cy)
+            else:
+                t = max(0.0, min(1.0, ((cl.cx - sx) * dx + (cl.cy - sy) * dy) / seg_len_sq))
+                proj_x = sx + t * dx
+                proj_y = sy + t * dy
+                dist = math.hypot(cl.cx - proj_x, cl.cy - proj_y)
+
+            if dist <= corridor_width:
+                return True, cl
+
+        return False, None
+
+    def should_wait_for_cluster(
+        self,
+        my_pos: Tuple[float, float],
+        target_pos: Tuple[float, float],
+        zone_obs: Dict[str, Any],
+        current_time: float
+    ) -> Tuple[bool, Optional[Tuple[float, float]]]:
+        """
+        Sound Cluster Deflection Decision:
+        If our intended rotation path or destination is compromised by an active sound cluster
+        AND we have time before zone shrinkage forces movement:
+        WAIT for bot clusters to eliminate each other before rotating in!
+
+        Returns: (should_wait, staging_position)
+        """
+        compromised, cluster = self.is_target_compromised(target_pos, current_time)
+        if not compromised:
+            compromised, cluster = self.is_path_compromised(my_pos, target_pos, current_time)
+
+        if not compromised or cluster is None:
+            return False, None
+
+        shrink_start = float(zone_obs.get("shrink_start", 60.0))
+        time_to_shrink = shrink_start - current_time
+
+        next_center = zone_obs.get("next_center", zone_obs.get("center", [0.0, 0.0]))
+        next_radius = float(zone_obs.get("next_radius", zone_obs.get("radius", 380.0)))
+        current_radius = float(zone_obs.get("radius", 560.0))
+        current_center = zone_obs.get("center", next_center)
+
+        dist_curr = math.hypot(my_pos[0] - current_center[0], my_pos[1] - current_center[1])
+        is_outside = dist_curr > (current_radius - 5.0)
+
+        dist_next = math.hypot(my_pos[0] - next_center[0], my_pos[1] - next_center[1])
+        dist_to_safe = max(0.0, dist_next - (next_radius - 25.0))
+        eta_seconds = (dist_to_safe / 11.7) * 1.2
+
+        # If not outside zone and we still have time buffer (> eta + 4.0s):
+        # We can safely WAIT outside the cluster for the brawling bots to eliminate each other!
+        if not is_outside and time_to_shrink > (eta_seconds + 4.0):
+            cl_dx = my_pos[0] - cluster.cx
+            cl_dy = my_pos[1] - cluster.cy
+            cl_dist = math.hypot(cl_dx, cl_dy)
+
+            staging_dist = 85.0
+            if cl_dist > 0.1:
+                stg_x = cluster.cx + staging_dist * (cl_dx / cl_dist)
+                stg_y = cluster.cy + staging_dist * (cl_dy / cl_dist)
+            else:
+                stg_x = my_pos[0]
+                stg_y = my_pos[1]
+
+            if self.gatekeeper is not None and not self.gatekeeper.is_walkable(stg_x, stg_y):
+                for r_off in [5.0, 10.0, -5.0, -10.0]:
+                    if self.gatekeeper.is_walkable(stg_x + r_off, stg_y):
+                        stg_x += r_off
+                        break
+                    elif self.gatekeeper.is_walkable(stg_x, stg_y + r_off):
+                        stg_y += r_off
+                        break
+
+            return True, (round(stg_x, 1), round(stg_y, 1))
+
+        return False, None
+
+    def get_deflected_rotation_target(
+        self,
+        my_pos: Tuple[float, float],
+        target_pos: Tuple[float, float],
+        zone_obs: Dict[str, Any],
+        current_time: float
+    ) -> Tuple[float, float]:
+        """
+        If path is compromised and we must move, deflect around the cluster
+        by computing a tangential detour waypoint 80m away from cluster center.
+        """
+        compromised, cluster = self.is_target_compromised(target_pos, current_time)
+        if not compromised:
+            compromised, cluster = self.is_path_compromised(my_pos, target_pos, current_time)
+
+        if not compromised or cluster is None:
+            return target_pos
+
+        dx = target_pos[0] - my_pos[0]
+        dy = target_pos[1] - my_pos[1]
+        length = math.hypot(dx, dy)
+        if length < 1.0:
+            return target_pos
+
+        perp_x1 = -dy / length
+        perp_y1 = dx / length
+        perp_x2 = dy / length
+        perp_y2 = -dx / length
+
+        mid_x = 0.5 * (my_pos[0] + target_pos[0])
+        mid_y = 0.5 * (my_pos[1] + target_pos[1])
+
+        d1 = math.hypot((mid_x + perp_x1 * 80.0) - cluster.cx, (mid_y + perp_y1 * 80.0) - cluster.cy)
+        d2 = math.hypot((mid_x + perp_x2 * 80.0) - cluster.cx, (mid_y + perp_y2 * 80.0) - cluster.cy)
+
+        chosen_perp_x = perp_x1 if d1 > d2 else perp_x2
+        chosen_perp_y = perp_y1 if d1 > d2 else perp_y2
+
+        waypoint_x = mid_x + chosen_perp_x * 80.0
+        waypoint_y = mid_y + chosen_perp_y * 80.0
+
+        if self.gatekeeper is not None and not self.gatekeeper.is_walkable(waypoint_x, waypoint_y):
+            for r_off in [5.0, 10.0, -5.0, -10.0]:
+                if self.gatekeeper.is_walkable(waypoint_x + r_off, waypoint_y):
+                    waypoint_x += r_off
+                    break
+
+        return (round(waypoint_x, 1), round(waypoint_y, 1))
+
+
 class SupplyDropInterceptor:
     """
     Supply Drop Snatcher & Objective Controller.
@@ -88,8 +378,12 @@ class SupplyDropInterceptor:
     - +3 POWER CUBES (+12% HP, +12% damage)
     - Full Energy recharge
 
-    Naive bots do not navigate to drops. Capturing 2 drops guarantees 10 cubes
-    (max stat cap), 4 upgrades, and full HP for the endgame.
+    Supply Drop Ambush Timing:
+    - Supply drops land 25s after announcement.
+    - Instead of rushing early directly into the 8m ring, set up an ambush 25m away with line of sight.
+    - Let other bots fight and butcher each other inside the 8m ring.
+    - Shoot from 25m standoff with clear line-of-sight and clean up the survivor!
+    - When the 8m ring is clear of enemies, step in to capture the drop and full repair.
     """
 
     def __init__(
@@ -97,27 +391,29 @@ class SupplyDropInterceptor:
         capture_radius: float = 8.0,
         capture_time: float = 4.0,
         walk_speed: float = 11.7,
+        ambush_dist: float = 25.0,
         gatekeeper: Optional[Any] = None
     ):
         self.capture_radius = capture_radius
         self.capture_time = capture_time
         self.walk_speed = walk_speed
+        self.ambush_dist = ambush_dist
         self.gatekeeper = gatekeeper
         self.active_drop_id: Optional[int] = None
         self.is_capturing: bool = False
+        self.is_ambushing: bool = False
         self.is_standoff: bool = False
 
-    def get_standoff_position(
+    def get_ambush_position(
         self,
         my_pos: Tuple[float, float],
         drop_pos: Tuple[float, float],
-        standoff_dist: float = 45.0
+        ambush_dist: float = 25.0
     ) -> Tuple[float, float]:
         """
-        Computes a 45m standoff position with line-of-sight to the drop/enemy.
-        Vulcan Failure Mode 2 Guard: prevents walking into contested 8m ring killzone.
-        Instead, establishes a 45m standoff position with line-of-sight to shoot
-        the stationary capturing enemy.
+        Computes an ambush position 25m away from the supply drop with direct line-of-sight.
+        Avoids rushing into the 8m ring early; allows our bot to hold aim down the capture ring,
+        let other bots brawl inside the 8m ring, and clean up the survivor from 25m.
         """
         my_x, my_y = float(my_pos[0]), float(my_pos[1])
         drop_x, drop_y = float(drop_pos[0]), float(drop_pos[1])
@@ -127,8 +423,8 @@ class SupplyDropInterceptor:
         dist_curr = math.hypot(dx, dy)
         base_angle = math.atan2(dy, dx) if dist_curr > 0.1 else 0.0
 
-        # If already situated at ~45m (42-48m) with clear LOS and walkable, hold position!
-        if 42.0 <= dist_curr <= 48.0:
+        # If already situated at ~25m (22-28m) with clear LOS and walkable, hold position!
+        if (ambush_dist - 3.0) <= dist_curr <= (ambush_dist + 3.0):
             has_los = True
             is_walk = True
             if self.gatekeeper is not None:
@@ -138,14 +434,13 @@ class SupplyDropInterceptor:
                 return (my_x, my_y)
 
         # Search angular offsets expanding outward from current approach angle
-        # Offsets in radians: 0, +15°, -15°, +30°, -30°, ... up to ±180°
         angle_offsets = [0.0]
         for deg in range(15, 181, 15):
             rad = math.radians(deg)
             angle_offsets.extend([rad, -rad])
 
-        # Test nominal 45m, with slight adjustments if blocked
-        radii = [standoff_dist, standoff_dist - 3.0, standoff_dist + 3.0, standoff_dist - 6.0, standoff_dist + 6.0]
+        # Test nominal 25m, with slight adjustments if blocked
+        radii = [ambush_dist, ambush_dist - 2.0, ambush_dist + 2.0, ambush_dist - 4.0, ambush_dist + 4.0]
 
         for r in radii:
             for d_th in angle_offsets:
@@ -162,10 +457,19 @@ class SupplyDropInterceptor:
                 if walkable and los:
                     return (round(cx, 1), round(cy, 1))
 
-        # Fallback along approach vector at exactly standoff_dist
-        fb_x = drop_x + standoff_dist * math.cos(base_angle)
-        fb_y = drop_y + standoff_dist * math.sin(base_angle)
+        # Fallback along approach vector at exactly ambush_dist
+        fb_x = drop_x + ambush_dist * math.cos(base_angle)
+        fb_y = drop_y + ambush_dist * math.sin(base_angle)
         return (round(fb_x, 1), round(fb_y, 1))
+
+    # Keep get_standoff_position as alias for backwards compatibility
+    def get_standoff_position(
+        self,
+        my_pos: Tuple[float, float],
+        drop_pos: Tuple[float, float],
+        standoff_dist: float = 25.0
+    ) -> Tuple[float, float]:
+        return self.get_ambush_position(my_pos, drop_pos, ambush_dist=standoff_dist)
 
     def evaluate_drop_objective(
         self,
@@ -176,19 +480,17 @@ class SupplyDropInterceptor:
     ) -> Optional[Tuple[float, float]]:
         """
         Evaluates active supply drops and determines if/when to intercept.
-        1. When a drop beacon appears (obs["drops"]), path toward the landing coordinate
-           when traversal_eta >= (lands_in - 2.0).
-        2. Once landed (lands_in <= 0.0), hold within the 8.0m capture radius for 4.0s
-           while maintaining aim at incoming approach paths.
-        3. Contested Ring Standoff (Vulcan Failure Mode 2 Guard):
-           If an enemy mech is ALREADY inside the 8m capture ring:
-           DO NOT step into the ring (avoid the sitting duck killzone).
-           Instead, establish a 45m standoff position with line-of-sight and shoot the stationary capturing enemy!
-        4. Returns target coordinates (x, y) to move to, or None if no drop should be pursued.
+        Supply Drop Ambush Timing:
+        1. Supply drops land 25s after announcement. Instead of rushing early into the 8m ring,
+           set up an ambush 25m away with line of sight.
+        2. Let other bots fight inside the 8m ring, and clean up the survivor.
+        3. Once the 8m ring is clear of enemies, step into the 8.0m capture radius to claim
+           the full repair and 3 power cubes!
         """
         if not drops:
             self.active_drop_id = None
             self.is_capturing = False
+            self.is_ambushing = False
             self.is_standoff = False
             return None
 
@@ -203,6 +505,7 @@ class SupplyDropInterceptor:
         if not valid_drops:
             self.active_drop_id = None
             self.is_capturing = False
+            self.is_ambushing = False
             self.is_standoff = False
             return None
 
@@ -214,14 +517,14 @@ class SupplyDropInterceptor:
         lands_in = float(best_drop.get("lands_in", 0.0))
         self.active_drop_id = best_drop.get("id")
 
-        # Traversal Kinematics (from config)
-        # Mech speed = 11.7 m/s walk, 19.5 m/s boost. Terrain detour factor = 1.15.
-        # Travel ETA = (dist_to_drop / 11.7) * 1.15
-        traversal_eta = (dist_to_drop / max(1.0, self.walk_speed)) * 1.15
+        # 25m Ambush Position
+        ambush_pos = self.get_ambush_position(my_pos, drop_pos, ambush_dist=self.ambush_dist)
+        dist_to_ambush = math.hypot(my_x - ambush_pos[0], my_y - ambush_pos[1])
 
-        # Check: Contested Ring Standoff (Vulcan Failure Mode 2 Guard)
-        # If an enemy mech is ALREADY inside the 8m capture ring:
-        # DO NOT step into the ring. Establish a 45m standoff position with line-of-sight!
+        # Traversal ETA to the 25m ambush position
+        traversal_eta = (dist_to_ambush / max(1.0, self.walk_speed)) * 1.15
+
+        # Check if any enemy is inside or contesting the 8m ring
         enemy_in_ring = False
         if visible_enemies:
             for e in visible_enemies:
@@ -230,36 +533,50 @@ class SupplyDropInterceptor:
                     enemy_in_ring = True
                     break
 
-        if enemy_in_ring:
-            self.is_capturing = False
-            self.is_standoff = True
-            standoff_pos = self.get_standoff_position(my_pos, drop_pos, standoff_dist=45.0)
-            return standoff_pos
-
-        self.is_standoff = False
-
-        # Phase A: Drop has touched down on the ground (lands_in <= 0.0) -> CAPTURE MODE
+        # =====================================================================
+        # Phase A: Drop has landed on the ground (lands_in <= 0.0)
+        # =====================================================================
         if lands_in <= 0.0:
+            # If an enemy is in the ring:
+            # DO NOT step into the ring! Hold the 25m ambush position with line-of-sight
+            # and clean up the survivor!
+            if enemy_in_ring:
+                self.is_capturing = False
+                self.is_ambushing = True
+                self.is_standoff = True
+                return ambush_pos
+
+            # Ring is clear! Step in to capture
+            self.is_ambushing = False
+            self.is_standoff = False
             self.is_capturing = True
+
             # If already comfortably inside the 8.0m capture ring (dist <= 6.5m), hold position!
             if dist_to_drop <= (self.capture_radius - 1.5):
                 return (my_x, my_y)
-            # Otherwise, navigate directly into the 8m ring
+
+            # Navigate into the 8m capture ring
             return drop_pos
 
-        # Phase B: Drop is descending in the air (lands_in > 0.0) -> PREDICTIVE TOUCHDOWN ARRIVAL
-        # Start pathing toward drop beacon when:
-        # traversal_eta >= (lands_in - 2.0)
-        # This ensures we arrive at the 8m perimeter exactly 2 seconds before the crate hits the dirt.
+        # =====================================================================
+        # Phase B: Drop is descending in the air (lands_in > 0.0)
+        # =====================================================================
+        # Instead of rushing into the 8m ring early, set up an ambush 25m away with line of sight!
+        # Path toward the 25m ambush position when traversal_eta >= (lands_in - 2.0).
         should_intercept = traversal_eta >= (lands_in - 2.0)
 
         if should_intercept:
             self.is_capturing = False
-            return drop_pos
+            self.is_ambushing = True
+            self.is_standoff = False
+            # Target is the 25m ambush position!
+            return ambush_pos
 
-        # Drop is still high in the sky (> 2s away from travel ETA) and bot is close enough to wait.
+        # Drop is still high in the sky and bot is close enough to wait.
         # Allow the bot to continue farming crates/cubes nearby instead of waiting idle.
         self.is_capturing = False
+        self.is_ambushing = False
+        self.is_standoff = False
         return None
 
     def get_defensive_aim(
@@ -269,15 +586,16 @@ class SupplyDropInterceptor:
         visible_enemies: List[Dict[str, Any]]
     ) -> Tuple[float, float]:
         """
-        Maintains aim at incoming approach paths while capturing the supply drop:
-        - If an enemy is visible, pre-aim directly at the closest intruder.
-        - If no enemy visible, look outward from the drop ring center along open approach vectors.
+        Maintains aim while in drop ambush (25m away) or capturing:
+        - If enemies are in/near the ring, aim directly at the lowest HP enemy (clean up survivor!).
+        - If no enemies visible, aim directly at the 8m drop center.
         """
         my_x, my_y = float(my_pos[0]), float(my_pos[1])
         if visible_enemies:
+            # Prioritize lowest HP (clean up the damaged survivor!), then closest
             sorted_enemies = sorted(
                 visible_enemies,
-                key=lambda e: math.hypot(e["pos"][0] - my_x, e["pos"][1] - my_y)
+                key=lambda e: (float(e.get("hp", 1000.0)), math.hypot(e["pos"][0] - my_x, e["pos"][1] - my_y))
             )
             target = sorted_enemies[0]
             dx = target["pos"][0] - my_x
@@ -286,8 +604,8 @@ class SupplyDropInterceptor:
 
         if drop:
             d_pos = drop.get("pos", [0.0, 0.0, 0.0])
-            dx = my_x - d_pos[0]
-            dy = my_y - d_pos[1]
+            dx = d_pos[0] - my_x
+            dy = d_pos[1] - my_y
             if math.hypot(dx, dy) > 0.5:
                 return math.atan2(dy, dx), 0.0
 
@@ -315,6 +633,9 @@ class ZoneGatekeeper:
 
         # Supply Drop Interceptor engine
         self.drop_interceptor = SupplyDropInterceptor(walk_speed=11.7, gatekeeper=self)
+
+        # Sound Cluster Deflection engine (triangulates death 600m & explosion 420m)
+        self.sound_deflector = SoundClusterDeflector(gatekeeper=self)
 
         # Stadium Bounding Box & Safe Bypasses
         # Stadium footprint: X in [-382.2, -170.2], Y in [-13.2, 266.8]
@@ -435,7 +756,86 @@ class ZoneGatekeeper:
         return self.drop_interceptor.get_defensive_aim(my_pos, drop, visible_enemies)
 
     # =========================================================================
-    # 2. Ohio Stadium Pinch Detection & Safe Bypass
+    # 2. Sound Cluster Deflection Engine
+    # =========================================================================
+
+    def update_acoustics(
+        self,
+        sounds: List[Dict[str, Any]],
+        my_pos: Tuple[float, float],
+        current_time: float
+    ):
+        """
+        Ingests heard sounds, triangulates source positions (death 600m, explosion 420m),
+        and clusters active conflict zones.
+        """
+        self.sound_deflector.update_acoustics(sounds, my_pos, current_time)
+
+    def get_active_sound_clusters(self, current_time: float) -> List[Dict[str, Any]]:
+        """
+        Returns active sound clusters with center, radius, death/explosion counts, and weights.
+        """
+        active = self.sound_deflector.get_active_clusters(current_time)
+        return [
+            {
+                "center": (round(cl.cx, 1), round(cl.cy, 1)),
+                "radius": cl.radius,
+                "weight": cl.total_weight,
+                "death_count": cl.death_count,
+                "explosion_count": cl.explosion_count,
+                "last_time": cl.last_time
+            }
+            for cl in active
+        ]
+
+    def should_wait_for_cluster(
+        self,
+        my_pos: Tuple[float, float],
+        target_pos: Tuple[float, float],
+        zone_obs: Dict[str, Any],
+        current_time: float
+    ) -> Tuple[bool, Optional[Tuple[float, float]]]:
+        """
+        Sound Cluster Deflection:
+        Triangulates death sounds (600m carry distance) and explosion sounds (420m)
+        to wait for bot clusters to eliminate each other before rotating in.
+        Returns: (should_wait, staging_position)
+        """
+        return self.sound_deflector.should_wait_for_cluster(my_pos, target_pos, zone_obs, current_time)
+
+    def get_deflected_rotation_target(
+        self,
+        my_pos: Tuple[float, float],
+        target_pos: Tuple[float, float],
+        zone_obs: Dict[str, Any],
+        current_time: float
+    ) -> Tuple[float, float]:
+        """
+        Computes a deflected rotation target that detours around active conflict clusters.
+        """
+        return self.sound_deflector.get_deflected_rotation_target(my_pos, target_pos, zone_obs, current_time)
+
+    def is_path_compromised_by_cluster(
+        self,
+        start_pos: Tuple[float, float],
+        goal_pos: Tuple[float, float],
+        current_time: float
+    ) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        """
+        Checks if traversing from start_pos to goal_pos cuts through an active sound cluster.
+        """
+        comp, cl = self.sound_deflector.is_path_compromised(start_pos, goal_pos, current_time)
+        if comp and cl is not None:
+            return True, {
+                "center": (round(cl.cx, 1), round(cl.cy, 1)),
+                "death_count": cl.death_count,
+                "explosion_count": cl.explosion_count,
+                "weight": cl.total_weight
+            }
+        return False, None
+
+    # =========================================================================
+    # 3. Ohio Stadium Pinch Detection & Safe Bypass
     # =========================================================================
 
     def is_stadium_pinch(
@@ -709,10 +1109,14 @@ class ZoneGatekeeper:
     def select_gatekeep_position(
         self,
         my_pos: Tuple[float, float],
-        chokepoints_or_choke: Union[List[Chokepoint], Chokepoint]
+        chokepoints_or_choke: Union[List[Chokepoint], Chokepoint],
+        current_time: Optional[float] = None
     ) -> Tuple[float, float]:
         """
         Positions our bot behind cover at the exit of the best chokepoint funnel.
+        If current_time is provided, checks active sound clusters:
+        Penalizes or filters out chokepoints compromised by death/explosion clusters,
+        deflecting our bot to safe uncontested funnels.
         Returns: (ambush_x, ambush_y)
         """
         if isinstance(chokepoints_or_choke, Chokepoint):
@@ -727,6 +1131,16 @@ class ZoneGatekeeper:
         for cp in chokepoints:
             dist_to_cp = math.hypot(cp.ambush_pos[0] - my_pos[0], cp.ambush_pos[1] - my_pos[1])
             score = cp.traffic_score * 1.5 - dist_to_cp * 0.12
+
+            # Sound cluster deflection penalty: avoid rotating into active bot clusters
+            if current_time is not None:
+                is_comp, cl = self.sound_deflector.is_target_compromised(cp.ambush_pos, current_time, safe_margin=75.0)
+                if not is_comp:
+                    is_comp, cl = self.sound_deflector.is_target_compromised(cp.pos, current_time, safe_margin=75.0)
+                if is_comp and cl is not None:
+                    # Heavily penalize chokepoints embedded in active death/explosion clusters
+                    score -= 500.0 * cl.total_weight
+
             if score > best_score:
                 best_score = score
                 best_cp = cp
@@ -874,6 +1288,53 @@ def evaluate_drop_objective(
     )
 
 
+def update_acoustics(
+    sounds: List[Dict[str, Any]],
+    my_pos: Tuple[float, float],
+    current_time: float
+):
+    """
+    Exposed functional API for Sound Cluster Deflection acoustics ingestion.
+    """
+    global _global_gatekeeper
+    if _global_gatekeeper is None:
+        _global_gatekeeper = ZoneGatekeeper()
+    _global_gatekeeper.update_acoustics(sounds, my_pos, current_time)
+
+
+def should_wait_for_cluster(
+    my_pos: Tuple[float, float],
+    target_pos: Tuple[float, float],
+    zone_obs: Dict[str, Any],
+    current_time: float
+) -> Tuple[bool, Optional[Tuple[float, float]]]:
+    """
+    Exposed functional API for Sound Cluster Deflection:
+    Checks if active death/explosion sound clusters suggest staging outside
+    to wait for brawling bots to eliminate each other.
+    """
+    global _global_gatekeeper
+    if _global_gatekeeper is None:
+        _global_gatekeeper = ZoneGatekeeper()
+    return _global_gatekeeper.should_wait_for_cluster(my_pos, target_pos, zone_obs, current_time)
+
+
+def get_deflected_rotation_target(
+    my_pos: Tuple[float, float],
+    target_pos: Tuple[float, float],
+    zone_obs: Dict[str, Any],
+    current_time: float
+) -> Tuple[float, float]:
+    """
+    Exposed functional API for Sound Cluster Deflection:
+    Computes a tangential detour around an active conflict cluster.
+    """
+    global _global_gatekeeper
+    if _global_gatekeeper is None:
+        _global_gatekeeper = ZoneGatekeeper()
+    return _global_gatekeeper.get_deflected_rotation_target(my_pos, target_pos, zone_obs, current_time)
+
+
 # =============================================================================
 # Standalone Runnable Test Suite with Simulated Campus Scenarios
 # =============================================================================
@@ -944,9 +1405,9 @@ def run_all_tests():
     print(f"    Bot at distance 200m (safely inside next circle): needs_rot={needs_rot_safe} (PASS)")
 
     # -------------------------------------------------------------------------
-    # Test 3: SupplyDropInterceptor & Objective Controller (Phase 2 Calibrated)
+    # Test 3: Supply Drop Ambush Timing (25m Standoff with LOS, Clean Up Survivor)
     # -------------------------------------------------------------------------
-    print("\n[Test 3] SupplyDropInterceptor & Objective Controller")
+    print("\n[Test 3] Supply Drop Ambush Timing (25m Ambush with LOS, Clean Up Survivor)")
     drop_test = {
         "id": 20000,
         "pos": [100.0, 100.0, 0.0],
@@ -955,62 +1416,113 @@ def run_all_tests():
         "progress": 0,
         "holder": None
     }
-    my_bot = (120.0, 100.0)  # 20m from drop, traversal_eta = (20/11.7)*1.15 = 1.97s
+    my_bot = (125.0, 100.0)  # Exactly at the 25m ambush perimeter
 
-    # Sub-case A: Beacon just appeared at t=70s (lands_in = 25.0s). Bot is close (20m).
-    # lands_in - 2.0 = 23.0s > traversal_eta (1.97s).
+    # Sub-case A: Beacon just appeared at t=70s (lands_in = 25.0s). Bot is already close (25m).
     # Expected: None (do not wait idle 25s early, continue farming).
     targ_a = evaluate_drop_objective(my_bot, [drop_test], [], 70.0)
-    print(f"  Sub-case A: lands_in=25.0s, dist=20m, ETA=1.97s -> target: {targ_a} (Expected: None)")
+    print(f"  Sub-case A: lands_in=25.0s, dist=25m -> target: {targ_a} (Expected: None - continue farming)")
     assert targ_a is None, "Should not intercept 25s early when close"
 
-    # Sub-case B: Predictive Touchdown Arrival:
-    # Bot is at 100m away, traversal_eta = (100 / 11.7) * 1.15 = 9.83s.
-    # When lands_in = 11.0s, lands_in - 2.0 = 9.0s <= traversal_eta (9.83s).
-    # Expected: start pathing toward drop beacon!
+    # Sub-case B: Predictive Ambush Setup:
+    # Bot is 100m from drop (200, 100). Ambush spot at (125, 100) (25m from drop).
+    # Distance to ambush spot = 75m. Traversal ETA = (75 / 11.7) * 1.15 = 7.37s.
+    # When lands_in = 9.0s, lands_in - 2.0 = 7.0s <= traversal_eta (7.37s).
+    # Expected: path toward 25m ambush spot (125.0, 100.0) to set up with LOS!
     far_bot_100m = (200.0, 100.0)
-    drop_test["lands_in"] = 11.0
-    targ_b = evaluate_drop_objective(far_bot_100m, [drop_test], [], 84.0)
-    print(f"  Sub-case B (Predictive Touchdown): lands_in=11.0s, dist=100m, ETA=9.83s >= lands_in-2.0 (9.0s) -> target: {targ_b}")
-    assert targ_b == (100.0, 100.0), "Should path toward landing coordinate when traversal_eta >= lands_in - 2.0!"
+    drop_test["lands_in"] = 9.0
+    targ_b = evaluate_drop_objective(far_bot_100m, [drop_test], [], 86.0)
+    d_ambush = math.hypot(targ_b[0] - 100.0, targ_b[1] - 100.0)
+    print(f"  Sub-case B (Predictive Ambush Setup): lands_in=9.0s, dist=100m -> target: {targ_b}, dist_to_drop={d_ambush:.1f}m")
+    assert targ_b != (100.0, 100.0), "Must NOT rush to the 8m ring center early!"
+    assert 22.0 <= d_ambush <= 28.0, f"Must establish ambush position ~25m away (actual: {d_ambush:.1f}m)!"
+    assert gk.has_los(targ_b[0], targ_b[1], 100.0, 100.0), "Ambush spot must have direct line of sight to drop!"
 
-    # Sub-case C: Drop has landed (lands_in = 0.0s), bot is outside the 8m ring (15m away).
+    # Sub-case C: Drop landed (lands_in = 0.0s), other bots brawling inside 8m ring!
+    # Enemy in 8m ring: let other bots fight inside 8m ring, shoot and clean up survivor!
     drop_test["lands_in"] = 0.0
-    targ_c = evaluate_drop_objective((115.0, 100.0), [drop_test], [], 95.0)
-    print(f"  Sub-case C: lands_in=0.0s, dist=15m -> target: {targ_c} (Expected: (100.0, 100.0))")
-    assert targ_c == (100.0, 100.0), "Should navigate into 8m capture ring"
+    enemy_in_ring = {"id": 99, "pos": [102.0, 100.0, 0.0], "hp": 480.0}
+    targ_c = evaluate_drop_objective(my_bot, [drop_test], [enemy_in_ring], 96.0)
+    dist_c = math.hypot(targ_c[0] - 100.0, targ_c[1] - 100.0)
+    print(f"  Sub-case C (Ring Contested): Enemy in ring -> target: {targ_c}, dist_to_drop={dist_c:.1f}m")
+    assert targ_c != (100.0, 100.0), "Must NOT step into the contested 8m ring killzone!"
+    assert 22.0 <= dist_c <= 28.0, "Must hold 25m ambush position while ring is contested!"
 
-    # Sub-case D: Drop has landed (lands_in = 0.0s), bot is inside 8m ring (4m away).
-    # Expected: hold within 8.0m capture radius for 4.0s!
-    inside_bot = (104.0, 100.0)
-    targ_d = evaluate_drop_objective(inside_bot, [drop_test], [], 96.0)
-    print(f"  Sub-case D: lands_in=0.0s, inside ring (dist=4m) -> target: {targ_d} (Hold ring)")
-    assert targ_d == inside_bot, "Should hold within 8.0m capture radius for 4.0s!"
-
-    # Sub-case E: Contested Ring Standoff (Vulcan Failure Mode 2 Guard):
-    # If an enemy mech is ALREADY inside the 8m capture ring:
-    # DO NOT step into the ring (avoid the sitting duck killzone).
-    # Instead, establish a 45m standoff position with line-of-sight and shoot the stationary capturing enemy!
-    enemy_in_ring = {"id": 99, "pos": [102.0, 100.0, 0.0], "hp": 1400.0}
-    targ_standoff = evaluate_drop_objective(my_bot, [drop_test], [enemy_in_ring], 96.0)
-    dist_standoff = math.hypot(targ_standoff[0] - 100.0, targ_standoff[1] - 100.0)
-    print(f"  Sub-case E (Contested Ring Standoff): Enemy in 8m ring -> target: {targ_standoff}, dist_to_drop={dist_standoff:.1f}m")
-    assert targ_standoff != (100.0, 100.0), "Must NOT step into the contested 8m ring!"
-    assert dist_standoff > 8.0, "Standoff position must be outside the 8.0m killzone!"
-    assert 40.0 <= dist_standoff <= 50.0, f"Standoff position must establish ~45m distance (actual: {dist_standoff:.1f}m)!"
-    assert gk.has_los(targ_standoff[0], targ_standoff[1], 100.0, 100.0), "Standoff position must have clear line-of-sight to drop!"
-
-    # Defensive aim while at standoff aiming at enemy in ring
-    aim_yaw, _ = gk.get_drop_defensive_aim(targ_standoff, drop_test, [enemy_in_ring])
-    enemy_yaw = math.atan2(enemy_in_ring["pos"][1] - targ_standoff[1], enemy_in_ring["pos"][0] - targ_standoff[0])
+    # Defensive aim locks onto the survivor/enemy inside the ring
+    aim_yaw, _ = gk.get_drop_defensive_aim(targ_c, drop_test, [enemy_in_ring])
+    enemy_yaw = math.atan2(enemy_in_ring["pos"][1] - targ_c[1], enemy_in_ring["pos"][0] - targ_c[0])
     dev = abs(math.atan2(math.sin(aim_yaw - enemy_yaw), math.cos(aim_yaw - enemy_yaw)))
-    print(f"    Defensive aim directly at capturing enemy: dev={math.degrees(dev):.2f}° (PASS)")
-    assert math.degrees(dev) < 0.1, "Defensive aim must lock onto capturing enemy in the ring!"
+    print(f"    Defensive aim locks on survivor in ring: dev={math.degrees(dev):.2f}° (PASS)")
+    assert math.degrees(dev) < 0.1, "Aim must lock directly onto enemy in ring to clean up survivor!"
+
+    # Sub-case D: Drop landed (lands_in = 0.0s), ring is clear of enemies!
+    # Survivor eliminated! Now step in to capture:
+    targ_d = evaluate_drop_objective(my_bot, [drop_test], [], 97.0)
+    print(f"  Sub-case D (Ring Clear): No enemies -> target: {targ_d} (Navigate into 8m ring to capture!)")
+    assert targ_d == (100.0, 100.0), "Should navigate into 8m capture ring once clear of enemies!"
+
+    # Sub-case E: Bot inside 8m ring (4m away) -> holds position for 4.0s capture!
+    inside_bot = (104.0, 100.0)
+    targ_e = evaluate_drop_objective(inside_bot, [drop_test], [], 98.0)
+    print(f"  Sub-case E: Inside 8m ring -> target: {targ_e} (Hold ring for 4.0s capture!)")
+    assert targ_e == inside_bot, "Should hold within 8.0m capture radius for 4.0s!"
 
     # -------------------------------------------------------------------------
-    # Test 4: Ohio Stadium Pinch Avoidance & Safe Bypass
+    # Test 4: Sound Cluster Deflection (Triangulate Death 600m & Explosion 420m)
     # -------------------------------------------------------------------------
-    print("\n[Test 4] Ohio Stadium Pinch Avoidance & Safe Bypass")
+    print("\n[Test 4] Sound Cluster Deflection (Triangulate Death 600m & Explosion 420m)")
+    # Clear any previous sounds
+    gk.sound_deflector.clusters.clear()
+
+    # Bot at (0, 0). Sound 1: death sound (600m carry distance) from East at mid distance (110m)
+    # Sound 2: explosion sound (420m carry distance) from East at mid distance (110m)
+    sounds_sim = [
+        {"kind": "death", "bearing": 0.0, "dist": "mid", "age": 0.1},
+        {"kind": "explosion", "bearing": 0.05, "dist": "mid", "age": 0.2}
+    ]
+    gk.update_acoustics(sounds_sim, (0.0, 0.0), current_time=30.0)
+    active_clusters = gk.get_active_sound_clusters(current_time=30.0)
+    print(f"  Ingested sounds -> Found {len(active_clusters)} active conflict cluster(s):")
+    assert len(active_clusters) >= 1, "Must triangulate and identify active sound cluster!"
+    cluster = active_clusters[0]
+    cl_center = cluster["center"]
+    print(f"    Cluster Center: {cl_center}, Deaths: {cluster['death_count']}, Explosions: {cluster['explosion_count']}, Weight: {cluster['weight']}")
+    assert cluster["death_count"] >= 1, "Must record death sound in cluster"
+    assert cluster["explosion_count"] >= 1, "Must record explosion sound in cluster"
+    assert math.hypot(cl_center[0] - 110.0, cl_center[1] - 0.0) < 25.0, "Cluster must center near triangulated coordinates ~110m East"
+
+    # Sub-case 4A: Intended rotation target is compromised by cluster, and time permits waiting:
+    # Target right at (110.0, 0.0). Time to shrink = 60s - 30s = 30s (plenty of time!).
+    zone_sound_test = {
+        "center": [110.0, 0.0],
+        "radius": 560.0,
+        "next_center": [110.0, 0.0],
+        "next_radius": 380.0,
+        "shrink_start": 60.0,
+        "t": 30.0
+    }
+    should_wait, staging_pos = gk.should_wait_for_cluster((0.0, 0.0), (110.0, 0.0), zone_sound_test, current_time=30.0)
+    print(f"  Sub-case 4A: Target inside sound cluster, time left=30s -> should_wait: {should_wait}, staging_pos: {staging_pos}")
+    assert should_wait is True, "Must wait for bot clusters to eliminate each other before rotating in!"
+    assert staging_pos is not None
+    d_to_cl = math.hypot(staging_pos[0] - cl_center[0], staging_pos[1] - cl_center[1])
+    print(f"    Staging setback distance from cluster: {d_to_cl:.1f}m (Target: ~85m)")
+    assert 70.0 <= d_to_cl <= 100.0, f"Staging position must maintain safe setback buffer (~85m) from cluster (actual: {d_to_cl:.1f}m)!"
+
+    # Sub-case 4B: Zone urgency forces rotation (time_left = 3s <= eta + 4s):
+    # Cannot wait anymore; must deflect around the cluster!
+    zone_sound_urgent = dict(zone_sound_test, shrink_start=33.0)  # time_to_shrink = 3.0s <= 4.0s
+    should_wait_urg, _ = gk.should_wait_for_cluster((0.0, 0.0), (110.0, 0.0), zone_sound_urgent, current_time=30.0)
+    assert should_wait_urg is False, "Cannot wait when gas is encroaching"
+    deflected_tgt = gk.get_deflected_rotation_target((0.0, 0.0), (110.0, 0.0), zone_sound_urgent, current_time=30.0)
+    d_deflect_to_cl = math.hypot(deflected_tgt[0] - cl_center[0], deflected_tgt[1] - cl_center[1])
+    print(f"  Sub-case 4B: Urgent rotation -> Deflected Waypoint: {deflected_tgt}, buffer from cluster: {d_deflect_to_cl:.1f}m")
+    assert d_deflect_to_cl >= 65.0, "Deflected waypoint must route around the cluster deathball!"
+
+    # -------------------------------------------------------------------------
+    # Test 5: Ohio Stadium Pinch Avoidance & Safe Bypass
+    # -------------------------------------------------------------------------
+    print("\n[Test 5] Ohio Stadium Pinch Avoidance & Safe Bypass")
     west_bot = (-360.0, 100.0)
     south_goal = (41.3, -72.8)
     north_goal = (41.3, 200.0)
@@ -1030,9 +1542,9 @@ def run_all_tests():
     assert bypass_n == gk.stadium_north_bypass, "Should select North bypass for northern destination!"
 
     # -------------------------------------------------------------------------
-    # Test 5: Gatekeeper Ambush Doctrine Simulation
+    # Test 6: Gatekeeper Ambush Doctrine Simulation
     # -------------------------------------------------------------------------
-    print("\n[Test 5] Gatekeeper Ambush Doctrine Simulation")
+    print("\n[Test 6] Gatekeeper Ambush Doctrine Simulation")
     chokes_240 = gk.find_chokepoints(380.0, center, 240.0)
     chosen_choke = chokes_240[0]
     ambush_pos = gk.select_gatekeep_position((41.3, -72.8), chosen_choke)
@@ -1055,9 +1567,9 @@ def run_all_tests():
     assert math.degrees(angle_error) < 5.0, "Pre-aim should align directly with incoming funnel path!"
 
     # -------------------------------------------------------------------------
-    # Test 6: Endgame Survival Anchor (< 5 alive)
+    # Test 7: Endgame Survival Anchor (< 5 alive)
     # -------------------------------------------------------------------------
-    print("\n[Test 6] Endgame Survival Anchor (< 5 alive)")
+    print("\n[Test 7] Endgame Survival Anchor (< 5 alive)")
     assert gk.is_endgame(alive_count=4, zone_radius=50.0) is True, "alive=4 must be endgame"
     assert gk.is_endgame(alive_count=12, zone_radius=300.0) is False, "alive=12 is not endgame"
 
@@ -1082,17 +1594,18 @@ def run_all_tests():
     assert 15.0 <= endgame_dist <= 52.0, "Endgame position must maintain perimeter buffer"
 
     # -------------------------------------------------------------------------
-    # Test 7: Micro-Benchmark Execution Time Constraint (< 2.0 ms)
+    # Test 8: Micro-Benchmark Execution Time Constraint (< 2.0 ms)
     # -------------------------------------------------------------------------
-    print("\n[Test 7] Micro-Benchmark Execution Time Constraint (< 2.0 ms)")
+    print("\n[Test 8] Micro-Benchmark Execution Time Constraint (< 2.0 ms)")
     iterations = 500
     t_bench_start = time.perf_counter()
 
     for i in range(iterations):
         gk.evaluate_rotation_urgency((41.3 + (i % 100), -72.8), zone_test, my_speed=11.7, current_time=45.0)
         chks = gk.find_chokepoints(380.0, center, 240.0)
-        gk.select_gatekeep_position((41.3, -72.8), chks)
-        evaluate_drop_objective((120.0, 100.0), [drop_test], [], 86.0)
+        gk.select_gatekeep_position((41.3, -72.8), chks, current_time=45.0)
+        gk.should_wait_for_cluster((41.3, -72.8), (110.0, 0.0), zone_sound_test, 30.0)
+        evaluate_drop_objective((125.0, 100.0), [drop_test], [], 86.0)
         gk.should_avoid_combat(4, 1400.0, enemy_far, 60.0)
         gk.get_endgame_position((41.3, -72.8), final_zone, 4)
 

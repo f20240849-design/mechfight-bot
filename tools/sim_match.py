@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
-Fast Local 16-Mech Battle Royale Simulator for MechFight/1.
-Simulates 1 OpportunistBot vs 15 Naive Bots across the full 480-second match.
+Fast Local 16-Mech Battle Royale Simulator for MechFight/1 (High-Fidelity Physics Twin).
+Simulates 1 Hero OpportunistBot vs 15 Semi-Intelligent Bots with:
+- True 252 m/s physical projectile simulation in obs["projectiles"]
+- Real-time line-of-sight checks and wall collisions
+- Event streaming (damaged events with world-frame bearings and rear-armor flags)
+- Floor weapon pickups and supply drop captures
 Used for offline strategy benchmarking, win-rate calculation, and rapid iteration.
 """
 
@@ -36,12 +40,15 @@ class MechSim:
             {"kind": "gun", "ammo": 12, "reload": 0.0, "cooldown": 0.0},
             None
         ]
+        self.charging_laser = False
+        self.laser_charge_s = 0.0
         self.last_damaged_time = -100.0
         self.last_attack_time = -100.0
         self.kills = 0
         self.damage_dealt = 0.0
         self.damage_taken = 0.0
         self.placement = 16
+        self.pending_events: List[Dict[str, Any]] = []
 
 
 class MatchSim:
@@ -51,6 +58,7 @@ class MatchSim:
         self.tick = 0
         self.dt = 0.1  # 10 decisions per second (tick_hz 20, decide_every 2)
         self.duration_s = 480.0
+        self.next_proj_id = 100
 
         # Zone configuration (from arena config)
         self.start_center = [41.3, -72.8]
@@ -67,9 +75,10 @@ class MatchSim:
         # Drops config: spawn at 70, 140, 210, fall for 25s
         self.drop_schedules = [70.0, 140.0, 210.0]
         self.active_drops = []
+        self.projectiles: List[Dict[str, Any]] = []
 
         # Floor loot & Crates & NPCs
-        self.pickups = []
+        self.pickups: List[Dict[str, Any]] = []
         self._spawn_initial_loot()
 
         # Crates
@@ -84,7 +93,7 @@ class MatchSim:
                 "hp": 300.0
             })
 
-        # NPCs (12 roaming NPCs with 350 HP, dropping 2 cubes)
+        # NPCs
         self.npcs = []
         for nid in range(12):
             n_angle = random.uniform(0, 2 * math.pi)
@@ -131,7 +140,7 @@ class MatchSim:
         self.hero_bot = Bot(hello_msg)
         self.nav = self.hero_bot.nav
 
-        # Ensure all spawn positions are walkable
+        # Walkable check
         for m in self.mechs:
             if not self.nav.is_walkable(m.pos[0], m.pos[1]):
                 c_2m = int((m.pos[0] - self.nav.min_x) / 2.0)
@@ -141,9 +150,8 @@ class MatchSim:
                 m.pos[1] = self.nav.min_y + nr * 2.0 + 1.0
 
     def _spawn_initial_loot(self):
-        # 30 floor weapons (lasers, lightnings, mortars)
         kinds = ["laser", "lightning", "mortar", "laser", "lightning"]
-        for pid in range(30):
+        for pid in range(35):
             p_angle = random.uniform(0, 2 * math.pi)
             p_dist = random.uniform(60, 440)
             self.pickups.append({
@@ -154,7 +162,6 @@ class MatchSim:
             })
 
     def get_zone_status(self) -> Dict[str, Any]:
-        """Calculates current zone radius, center, and shrink times."""
         elapsed = self.t
         curr_radius = self.start_radius
         curr_center = self.start_center
@@ -175,7 +182,6 @@ class MatchSim:
             t_shrink_end = t_hold_end + s_s
 
             if elapsed < t_hold_end:
-                curr_radius = curr_radius
                 next_radius = p_rad
                 shrink_start = t_hold_end
                 shrink_end = t_shrink_end
@@ -204,21 +210,17 @@ class MatchSim:
         }
 
     def step(self) -> bool:
-        """Simulates one 0.1s tick. Returns False when match ends."""
         self.t += self.dt
         self.tick += 1
 
         alive_mechs = [m for m in self.mechs if m.alive]
         if len(alive_mechs) <= 1 or self.t >= self.duration_s:
-            # Match Over
             for m in alive_mechs:
                 m.placement = len(alive_mechs)
             return False
 
         zone = self.get_zone_status()
         z_center = zone["center"]
-        z_radius = zone["radius"]
-        z_dps = zone["dps"]
 
         # 1. Update Supply Drops
         for d_time in self.drop_schedules:
@@ -230,33 +232,105 @@ class MatchSim:
                             z_center[1] + math.sin(d_angle) * d_dist, 0.0],
                     "lands_in": 25.0,
                     "holder": None,
-                    "capture_progress": {}  # mech_id: seconds inside
+                    "capture_progress": {}
                 })
 
         for drop in self.active_drops:
             if drop["lands_in"] > 0:
                 drop["lands_in"] = max(0.0, drop["lands_in"] - self.dt)
 
-        # 2. Hero Bot Step
+        # 2. Advance physical projectiles
+        self._update_projectiles()
+
+        # 3. Hero Bot Step
         hero = self.mechs[0]
         if hero.alive:
             obs = self._build_obs_for_hero(zone)
+            hero.pending_events = []
             try:
                 act = self.hero_bot.act(obs)
             except Exception as e:
                 act = {}
             self._apply_hero_action(hero, act)
 
-        # 3. Naive Bots Step (Bots 1 to 15)
+        # 4. Naive Bots Step (Bots 1 to 15)
         for m in self.mechs[1:]:
             if not m.alive:
                 continue
+            m.pending_events = []
             self._step_naive_bot(m, zone)
 
-        # 4. Resolve Combat, Bullets, Lasers, Drops, and Zone Damage
+        # 5. Resolve Combat, Drops, and Zone Damage
         self._resolve_tick(zone)
 
         return True
+
+    def _update_projectiles(self):
+        alive_projs = []
+        for p in self.projectiles:
+            # Advance
+            p["pos"][0] += p["vel"][0] * self.dt
+            p["pos"][1] += p["vel"][1] * self.dt
+            p["pos"][2] += p["vel"][2] * self.dt
+            p["traveled"] += p["speed"] * self.dt
+
+            # Wall collision
+            if not self.nav.is_walkable(p["pos"][0], p["pos"][1]) and p["traveled"] > 5.0:
+                continue
+
+            if p["traveled"] > p["max_range"]:
+                continue
+
+            # Check collision against all mechs
+            hit = False
+            for target in self.mechs:
+                if target.id == p["shooter_id"] or not target.alive:
+                    continue
+
+                dx = target.pos[0] - p["pos"][0]
+                dy = target.pos[1] - p["pos"][1]
+                dist = math.hypot(dx, dy)
+
+                if dist <= 2.5:  # Cylinder hit!
+                    hit = True
+                    dmg = p["damage"]
+                    # Rear armor check
+                    p_yaw = math.atan2(p["vel"][1], p["vel"][0])
+                    t_yaw = target.aim[0]
+                    angle_diff = abs(math.atan2(math.sin(p_yaw - t_yaw), math.cos(p_yaw - t_yaw)))
+                    is_rear = angle_diff < math.radians(90.0)
+                    if is_rear:
+                        dmg *= 1.5
+
+                    target.hp -= dmg
+                    target.last_damaged_time = self.t
+                    target.damage_taken += dmg
+
+                    # Attacker credit
+                    shooter = self.mechs[p["shooter_id"]]
+                    shooter.damage_dealt += dmg
+                    shooter.last_attack_time = self.t
+
+                    # Send damaged event to target
+                    target.pending_events.append({
+                        "type": "damaged",
+                        "amount": dmg,
+                        "weapon": p["kind"],
+                        "bearing": math.atan2(-p["vel"][1], -p["vel"][0]),
+                        "by": shooter.id,
+                        "rear": is_rear
+                    })
+
+                    if target.hp <= 0:
+                        target.alive = False
+                        shooter.kills += 1
+                        shooter.cubes += target.cubes + 2
+                    break
+
+            if not hit:
+                alive_projs.append(p)
+
+        self.projectiles = alive_projs
 
     def _build_obs_for_hero(self, zone: Dict[str, Any]) -> Dict[str, Any]:
         hero = self.mechs[0]
@@ -279,10 +353,10 @@ class MatchSim:
                     "max_hp": m.max_hp,
                     "cubes": m.cubes,
                     "weapons": [w.get("kind") for w in m.weapons if w],
-                    "charging": False
+                    "charging": m.charging_laser
                 })
 
-        # Add living NPCs within 120m
+        # Add NPCs
         for npc in self.npcs:
             if npc["hp"] <= 0:
                 continue
@@ -297,20 +371,23 @@ class MatchSim:
                     "max_hp": npc["max_hp"]
                 })
 
+        # Visible projectiles
+        vis_projs = [
+            {"id": p["id"], "kind": p["kind"], "pos": list(p["pos"]), "vel": list(p["vel"])}
+            for p in self.projectiles
+            if p["shooter_id"] != hero.id and math.hypot(p["pos"][0] - hero.pos[0], p["pos"][1] - hero.pos[1]) < 120.0
+        ]
+
         # Pickups within 100m
         near_pickups = [
             p for p in self.pickups
             if math.hypot(p["pos"][0] - hero.pos[0], p["pos"][1] - hero.pos[1]) < 100.0
         ]
 
-        # Drops
-        drop_obs = []
-        for d in self.active_drops:
-            drop_obs.append({
-                "pos": list(d["pos"]),
-                "lands_in": d["lands_in"],
-                "holder": d["holder"]
-            })
+        drop_obs = [
+            {"pos": list(d["pos"]), "lands_in": d["lands_in"], "holder": d["holder"]}
+            for d in self.active_drops
+        ]
 
         dist_from_zone_center = math.hypot(hero.pos[0] - zone["center"][0], hero.pos[1] - zone["center"][1])
         in_zone = dist_from_zone_center <= zone["radius"]
@@ -334,20 +411,19 @@ class MatchSim:
                 "weapons": hero.weapons
             },
             "mechs": visible_mechs,
+            "projectiles": vis_projs,
             "pickups": near_pickups,
             "drops": drop_obs,
             "crates": [c for c in self.crates if c["hp"] > 0 and math.hypot(c["pos"][0] - hero.pos[0], c["pos"][1] - hero.pos[1]) < 80.0],
             "zone": zone,
-            "events": []
+            "events": list(hero.pending_events)
         }
 
     def _apply_hero_action(self, hero: MechSim, act: Dict[str, Any]):
-        # Aim slewing
         if "aim" in act and act["aim"]:
             hero.aim[0] = act["aim"][0]
             hero.aim[1] = act["aim"][1]
 
-        # Movement
         move_vec = act.get("move", [0.0, 0.0])
         speed = 19.5 if (act.get("boost") and hero.energy > 5.0) else 11.7
         if act.get("boost") and hero.energy > 5.0:
@@ -362,7 +438,6 @@ class MatchSim:
         else:
             hero.vel = [0.0, 0.0, 0.0]
 
-        # Walkable check with sliding
         nx = hero.pos[0] + hero.vel[0] * self.dt
         ny = hero.pos[1] + hero.vel[1] * self.dt
         if self.nav.is_walkable(nx, ny):
@@ -373,11 +448,9 @@ class MatchSim:
         elif self.nav.is_walkable(hero.pos[0], ny):
             hero.pos[1] = ny
 
-        # Firing
         fire = act.get("fire", [False, False])
         self._execute_mech_firing(hero, fire)
 
-        # Loot action (take/drop)
         take_id = act.get("take")
         if take_id is not None:
             for p in list(self.pickups):
@@ -389,19 +462,17 @@ class MatchSim:
                         break
 
     def _step_naive_bot(self, m: MechSim, zone: Dict[str, Any]):
-        """Naive bot: walks directly to zone.next_center, aims at nearest enemy with unled aim, holds fire."""
         nx, ny = zone["next_center"]
         dx = nx - m.pos[0]
         dy = ny - m.pos[1]
         dist_to_center = math.hypot(dx, dy)
 
-        # Movement: straight to center
         if dist_to_center > 10.0:
             m.vel[0] = (dx / dist_to_center) * 11.7
             m.vel[1] = (dy / dist_to_center) * 11.7
         else:
             m.vel = [0.0, 0.0, 0.0]
-        # Walkable check with sliding
+
         nx_pos = m.pos[0] + m.vel[0] * self.dt
         ny_pos = m.pos[1] + m.vel[1] * self.dt
         if self.nav.is_walkable(nx_pos, ny_pos):
@@ -412,24 +483,31 @@ class MatchSim:
         elif self.nav.is_walkable(m.pos[0], ny_pos):
             m.pos[1] = ny_pos
 
-        # Find closest living target (hero or other naive bot)
+        # Floor pickup pickup for naive bots too!
+        if m.weapons[1] is None:
+            for p in list(self.pickups):
+                if math.hypot(p["pos"][0] - m.pos[0], p["pos"][1] - m.pos[1]) <= 4.0:
+                    m.weapons[1] = {"kind": p["kind"], "cooldown": 0.0}
+                    self.pickups.remove(p)
+                    break
+
         closest_target = None
         closest_dist = 1e9
         for other in self.mechs:
             if other.id == m.id or not other.alive:
                 continue
             odist = math.hypot(other.pos[0] - m.pos[0], other.pos[1] - m.pos[1])
-            if odist < closest_dist and odist <= 120.0:
+            if odist < closest_dist and odist <= 140.0:
                 closest_dist = odist
                 closest_target = other
 
-        # Naive aim: direct aim without leading
         if closest_target:
             tdx = closest_target.pos[0] - m.pos[0]
             tdy = closest_target.pos[1] - m.pos[1]
             m.aim[0] = math.atan2(tdy, tdx)
-            # Hold trigger
-            self._execute_mech_firing(m, [True, False])
+            # Firing
+            has_secondary = m.weapons[1] is not None
+            self._execute_mech_firing(m, [True, has_secondary])
 
     def _execute_mech_firing(self, m: MechSim, fire: List[bool]):
         for slot, should_f in enumerate(fire):
@@ -447,15 +525,24 @@ class MatchSim:
                 elif cd <= 0 and ammo > 0:
                     w["ammo"] = ammo - 1
                     w["cooldown"] = 0.24
-                    self._cast_gun_bullet(m)
+                    self._spawn_gun_bullet(m)
                     if w["ammo"] <= 0:
                         w["reload"] = 2.4
                         w["ammo"] = 12
 
             elif kind == "laser":
+                # Laser charge cycle
                 if cd <= 0:
-                    w["cooldown"] = 1.65 + 0.75  # charge + cooldown
-                    self._cast_laser_beam(m)
+                    if not m.charging_laser:
+                        m.charging_laser = True
+                        m.laser_charge_s = 0.0
+                    else:
+                        m.laser_charge_s += self.dt
+                        if m.laser_charge_s >= 0.75:
+                            m.charging_laser = False
+                            m.laser_charge_s = 0.0
+                            w["cooldown"] = 1.65
+                            self._cast_laser_beam(m)
 
             elif kind == "lightning":
                 if cd <= 0 and m.energy >= 3.0:
@@ -463,50 +550,25 @@ class MatchSim:
                     m.energy -= 3.0
                     self._cast_lightning(m)
 
-    def _cast_gun_bullet(self, shooter: MechSim):
-        """Fires 252 m/s bullet along shooter.aim[0]. Checks hits on other mechs/NPCs."""
+    def _spawn_gun_bullet(self, shooter: MechSim):
         yaw = shooter.aim[0]
-        # Bullet travels along yaw
-        cos_y = math.cos(yaw)
-        sin_y = math.sin(yaw)
-
+        speed = 252.0
+        vx = math.cos(yaw) * speed
+        vy = math.sin(yaw) * speed
         cube_mult = 1.0 + 0.04 * min(shooter.cubes, 10)
-        base_dmg = 45.0 * cube_mult
+        self.next_proj_id += 1
 
-        for target in self.mechs:
-            if target.id == shooter.id or not target.alive:
-                continue
-            # Ray-circle intersection
-            tx = target.pos[0] - shooter.pos[0]
-            ty = target.pos[1] - shooter.pos[1]
-            t_dist = math.hypot(tx, ty)
-            if t_dist > 230.0:
-                continue
-            if not self.nav.has_los(shooter.pos[0], shooter.pos[1], target.pos[0], target.pos[1]):
-                continue
-
-            # Project target onto bullet ray
-            proj = tx * cos_y + ty * sin_y
-            if proj > 0:
-                perp_dist = abs(tx * sin_y - ty * cos_y)
-                # Mech hit radius is 2.5m
-                if perp_dist <= 2.5:
-                    # Check rear armor multiplier
-                    dmg = base_dmg
-                    t_facing = target.aim[0]
-                    angle_diff = abs(math.atan2(math.sin(yaw - t_facing), math.cos(yaw - t_facing)))
-                    if angle_diff < math.radians(90.0):
-                        dmg *= 1.5  # Rear hit!
-
-                    target.hp -= dmg
-                    target.last_damaged_time = self.t
-                    shooter.damage_dealt += dmg
-                    shooter.last_attack_time = self.t
-                    if target.hp <= 0:
-                        target.alive = False
-                        shooter.kills += 1
-                        shooter.cubes += target.cubes + 2
-                    break
+        self.projectiles.append({
+            "id": self.next_proj_id,
+            "kind": "gun",
+            "shooter_id": shooter.id,
+            "pos": [shooter.pos[0] + math.cos(yaw) * 3.0, shooter.pos[1] + math.sin(yaw) * 3.0, 7.0],
+            "vel": [vx, vy, 0.0],
+            "speed": speed,
+            "traveled": 0.0,
+            "max_range": 230.0,
+            "damage": 45.0 * cube_mult
+        })
 
     def _cast_laser_beam(self, shooter: MechSim):
         yaw = shooter.aim[0]
@@ -530,11 +592,20 @@ class MatchSim:
                 if perp <= 2.5:
                     dmg = base_dmg
                     angle_diff = abs(math.atan2(math.sin(yaw - target.aim[0]), math.cos(yaw - target.aim[0])))
-                    if angle_diff < math.radians(90.0):
+                    is_rear = angle_diff < math.radians(90.0)
+                    if is_rear:
                         dmg *= 1.5
                     target.hp -= dmg
                     target.last_damaged_time = self.t
                     shooter.damage_dealt += dmg
+                    target.pending_events.append({
+                        "type": "damaged",
+                        "amount": dmg,
+                        "weapon": "laser",
+                        "bearing": math.atan2(-sin_y, -cos_y),
+                        "by": shooter.id,
+                        "rear": is_rear
+                    })
                     if target.hp <= 0:
                         target.alive = False
                         shooter.kills += 1
@@ -559,6 +630,14 @@ class MatchSim:
                     target.hp -= base_dmg
                     target.last_damaged_time = self.t
                     shooter.damage_dealt += base_dmg
+                    target.pending_events.append({
+                        "type": "damaged",
+                        "amount": base_dmg,
+                        "weapon": "lightning",
+                        "bearing": math.atan2(-dy, -dx),
+                        "by": shooter.id,
+                        "rear": False
+                    })
                     if target.hp <= 0:
                         target.alive = False
                         shooter.kills += 1
@@ -569,7 +648,6 @@ class MatchSim:
         z_rad = zone["radius"]
         z_dps = zone["dps"]
 
-        # Cooldown & Regen tick
         for m in self.mechs:
             if not m.alive:
                 continue
@@ -577,7 +655,6 @@ class MatchSim:
                 if w and w.get("cooldown", 0) > 0:
                     w["cooldown"] = max(0.0, w["cooldown"] - self.dt)
 
-            # Zone gas damage
             dist_to_zc = math.hypot(m.pos[0] - z_center[0], m.pos[1] - z_center[1])
             if dist_to_zc > z_rad:
                 m.hp -= z_dps * self.dt
@@ -585,12 +662,10 @@ class MatchSim:
                 if m.hp <= 0:
                     m.alive = False
 
-            # Out of combat active regen: 45 HP/s after 5.0s
             if self.t - max(m.last_damaged_time, m.last_attack_time) >= 5.0:
                 if m.hp < m.max_hp:
                     m.hp = min(m.max_hp, m.hp + 45.0 * self.dt)
 
-        # Supply drop capture resolution
         for drop in list(self.active_drops):
             if drop["lands_in"] > 0:
                 continue
@@ -601,15 +676,15 @@ class MatchSim:
                 if math.hypot(m.pos[0] - dx, m.pos[1] - dy) <= 8.0:
                     prog = drop["capture_progress"].get(m.id, 0.0) + self.dt
                     drop["capture_progress"][m.id] = prog
-                    if prog >= 4.0:  # Captured!
-                        m.hp = m.max_hp  # 100% full repair!
+                    if prog >= 4.0:
+                        m.hp = m.max_hp
                         m.cubes += 3
                         self.active_drops.remove(drop)
                         break
 
 
-def run_benchmark(num_matches: int = 20) -> Dict[str, Any]:
-    print(f"[*] Running {num_matches} Headless Simulated Practice Matches vs 15 Naive Bots...")
+def run_benchmark(num_matches: int = 10) -> Dict[str, Any]:
+    print(f"[*] Running {num_matches} High-Fidelity Practice Matches vs 15 Bots...")
     t0 = time.time()
     placements = []
     kills_list = []
@@ -618,7 +693,7 @@ def run_benchmark(num_matches: int = 20) -> Dict[str, Any]:
     top3 = 0
 
     for m_idx in range(num_matches):
-        sim = MatchSim(seed=1000 + m_idx)
+        sim = MatchSim(seed=2000 + m_idx)
         step_count = 0
         while sim.step():
             step_count += 1
@@ -626,14 +701,11 @@ def run_benchmark(num_matches: int = 20) -> Dict[str, Any]:
                 break
 
         hero = sim.mechs[0]
-        # Calculate final placement
         alive_at_end = [m for m in sim.mechs if m.alive]
         if hero.alive:
-            # Sorted by HP
             alive_at_end.sort(key=lambda m: -m.hp)
             place = alive_at_end.index(hero) + 1
         else:
-            # Dead mechs ranked by death order
             place = len(alive_at_end) + 1
 
         placements.append(place)
@@ -648,24 +720,16 @@ def run_benchmark(num_matches: int = 20) -> Dict[str, Any]:
     avg_place = sum(placements) / len(placements)
     avg_kills = sum(kills_list) / len(kills_list)
     avg_dmg = sum(damage_list) / len(damage_list)
+    est_score = 16.0 - avg_place
 
-    # Tournament score estimate (16 - avg_place + avg_kills * 0.5)
-    est_score = max(0.0, 16.0 - avg_place + avg_kills * 0.5)
-
-    print(f"[+] Completed {num_matches} matches in {dt:.2f}s ({dt/num_matches*1000:.1f} ms/match)")
+    print(f"[+] Completed {num_matches} matches in {dt:.2f}s ({dt*1000/num_matches:.1f} ms/match)")
     print(f"    Avg Placement: {avg_place:.2f} / 16  (1st place wins: {wins}/{num_matches}, Top 3: {top3}/{num_matches})")
     print(f"    Avg Kills:     {avg_kills:.2f}")
     print(f"    Avg Damage:    {avg_dmg:.1f}")
     print(f"    Estimated Hackathon Score: {est_score:.2f} / 15.0")
-    return {
-        "avg_placement": avg_place,
-        "avg_kills": avg_kills,
-        "avg_dmg": avg_dmg,
-        "est_score": est_score,
-        "wins": wins,
-        "top3": top3
-    }
+    return {"avg_place": avg_place, "score": est_score}
+
 
 if __name__ == "__main__":
-    n = int(sys.argv[1]) if len(sys.argv) > 1 else 20
+    n = int(sys.argv[1]) if len(sys.argv) > 1 else 10
     run_benchmark(n)
