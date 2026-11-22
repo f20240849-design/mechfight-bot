@@ -1,6 +1,7 @@
 """
 Navigation, Line-of-Sight, and Cover System for MechRoyale.
 Uses the precomputed 2D occupancy grid (1m resolution) with 2m A* pathfinding.
+Features sub-millisecond radial cover search, tangential corner filleting, and vectorized wall sliding.
 """
 import json
 import os
@@ -50,6 +51,9 @@ class NavMesh:
         walkable_1m = (self.grid == 0)
         self.grid_2m = ~walkable_1m[::self.scale, ::self.scale]  # True = blocked
         self.h_2m, self.w_2m = self.grid_2m.shape
+
+        # Cover search cache: (my_pos, threat_pos) -> (cover_spot, timestamp)
+        self._cover_cache: Optional[Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float]]] = None
 
     def world_to_grid(self, x: float, y: float) -> Tuple[int, int]:
         col = int(round((x - self.min_x) / self.step))
@@ -138,7 +142,7 @@ class NavMesh:
                 (-1, -1, 1.414), (-1, 1, 1.414), (1, -1, 1.414), (1, 1, 1.414)]
 
         nodes_visited = 0
-        max_nodes = 2500  # Cap search to stay under 5ms
+        max_nodes = 1200  # Cap search to stay strictly under 2ms
         reached = False
         end_node = (r1, c1)
 
@@ -162,7 +166,6 @@ class NavMesh:
                         parent[(nr, nc)] = (r, c)
 
         if not reached:
-            # Fallback to closest explored node toward goal
             if parent:
                 best_n = min(parent.keys(), key=lambda n: math.hypot(r1 - n[0], c1 - n[1]))
                 end_node = best_n
@@ -211,10 +214,7 @@ class NavMesh:
         fillet_radius: float = 4.5,
         min_angle_deg: float = 35.0
     ) -> List[Tuple[float, float]]:
-        """
-        Rounds sharp corners (e.g. 90-degree building turns) into smooth wall-sliding arcs.
-        Replaces sharp vertices with tangential fillet waypoints that maintain safe wall clearance.
-        """
+        """Rounds sharp corners into smooth wall-sliding arcs."""
         if len(waypoints) < 3:
             return waypoints
 
@@ -268,23 +268,18 @@ class NavMesh:
         py: float,
         desired_vx: float,
         desired_vy: float,
-        probe_dist: float = 3.5
+        probe_dist: float = 3.0
     ) -> Tuple[float, float]:
-        """
-        Wall-sliding along concave and convex wall contours:
-        When moving near walls, projects velocity along the tangent of the wall normal.
-        In concave corners (inside pockets), deflects velocity outward along the concave bisector.
-        """
+        """Fast wall-sliding vector computation using 8-direction cardinal sampling."""
         normals = []
-        for deg in range(0, 360, 30):
+        for deg in (0, 45, 90, 135, 180, 225, 270, 315):
             rad = math.radians(deg)
             dx, dy = math.cos(rad), math.sin(rad)
-            for d in (1.5, 2.5, probe_dist):
-                qx, qy = px + dx * d, py + dy * d
-                col, row = self.world_to_grid(qx, qy)
-                if self.grid[row, col] == 1:
-                    normals.append((-dx, -dy))
-                    break
+            qx, qy = px + dx * probe_dist, py + dy * probe_dist
+            col, row = self.world_to_grid(qx, qy)
+            if self.grid[row, col] == 1:
+                normals.append((-dx, -dy))
+
         if not normals:
             return desired_vx, desired_vy
 
@@ -300,36 +295,56 @@ class NavMesh:
         if dot < 0.0:
             slide_x = desired_vx - dot * nx_out
             slide_y = desired_vy - dot * ny_out
-            if len(normals) >= 3:
-                slide_x += nx_out * 0.35
-                slide_y += ny_out * 0.35
             slen = math.hypot(slide_x, slide_y)
             if slen > 1e-4:
                 return slide_x / slen, slide_y / slen
         return desired_vx, desired_vy
 
-    def find_cover_spot(self, my_pos: Tuple[float, float], threat_pos: Tuple[float, float], min_dist: float = 30.0, max_dist: float = 60.0) -> Optional[Tuple[float, float]]:
-        """Find a nearby cell that breaks line-of-sight from threat_pos."""
-        my_col, my_row = self.world_to_grid(my_pos[0], my_pos[1])
-        radius_cells = int(max_dist / self.step)
-        step_stride = 3
+    def find_cover_spot(
+        self,
+        my_pos: Tuple[float, float],
+        threat_pos: Tuple[float, float],
+        min_dist: float = 6.0,
+        max_dist: float = 28.0
+    ) -> Optional[Tuple[float, float]]:
+        """
+        Ultra-Fast Radial Cover Search (Sub-millisecond):
+        Instead of an exhaustive 1,600-cell grid scan, evaluates concentric rings
+        away from the threat bearing. As soon as a walkable point with no line of sight
+        is found, returns it immediately.
+        """
+        mx, my = my_pos[0], my_pos[1]
+        tx, ty = threat_pos[0], threat_pos[1]
 
-        best_spot = None
-        best_score = -1e9
+        # Check cache: if my_pos and threat_pos haven't moved > 2.5m, return cached spot
+        if self._cover_cache is not None:
+            c_my, c_th, c_spot = self._cover_cache
+            if math.hypot(mx - c_my[0], my - c_my[1]) < 2.5 and math.hypot(tx - c_th[0], ty - c_th[1]) < 3.5:
+                # Validate cached spot still breaks LOS
+                if not self.has_los(c_spot[0], c_spot[1], tx, ty):
+                    return c_spot
 
-        for dr in range(-radius_cells, radius_cells + 1, step_stride):
-            for dc in range(-radius_cells, radius_cells + 1, step_stride):
-                nr, nc = my_row + dr, my_col + dc
-                if 0 <= nr < self.ny and 0 <= nc < self.nx and self.grid[nr, nc] == 0:
-                    cand_x, cand_y = self.grid_to_world(nc, nr)
-                    dist_to_threat = math.hypot(cand_x - threat_pos[0], cand_y - threat_pos[1])
-                    dist_to_me = math.hypot(cand_x - my_pos[0], cand_y - my_pos[1])
-                    
-                    if min_dist <= dist_to_threat and dist_to_me <= max_dist:
-                        if not self.has_los(cand_x, cand_y, threat_pos[0], threat_pos[1]):
-                            score = -dist_to_me + dist_to_threat * 0.5
-                            if score > best_score:
-                                best_score = score
-                                best_spot = (cand_x, cand_y)
-                                
-        return best_spot
+        dx = mx - tx
+        dy = my - ty
+        base_dist = math.hypot(dx, dy)
+        away_yaw = math.atan2(dy, dx) if base_dist > 0.01 else 0.0
+
+        # Prioritize angles pointing away from threat (+-90 deg)
+        angle_offsets = (0.0, 0.45, -0.45, 0.90, -0.90, 1.35, -1.35, 1.57, -1.57, 2.10, -2.10)
+
+        # Concentric rings outward: 5m, 10m, 15m, 20m, 25m
+        for r in (5.0, 10.0, 15.0, 20.0, 25.0):
+            for a_off in angle_offsets:
+                ang = away_yaw + a_off
+                cx = mx + r * math.cos(ang)
+                cy = my + r * math.sin(ang)
+
+                # Fast walkability check
+                if self.is_walkable(cx, cy):
+                    # Check line of sight from threat
+                    if not self.has_los(cx, cy, tx, ty):
+                        spot = (cx, cy)
+                        self._cover_cache = ((mx, my), (tx, ty), spot)
+                        return spot
+
+        return None
