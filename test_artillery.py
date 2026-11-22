@@ -287,17 +287,17 @@ def test_smart_weapon_swap_manager():
 
 def test_npc_hunter():
     print("\n=== TEST 6: NPCHunter (Economy Snowball: Opening 60s, 90m, 2 Cubes) ===")
-    hunter = NPCHunter(hunt_window_s=60.0, max_hunt_dist=90.0)
+    hunter = NPCHunter(hunt_window_s=60.0, max_hunt_dist=90.0, player_threat_dist=55.0)
     my_pos = [0.0, 0.0, 0.0]
 
-    # Entity list with NPCs and mechs
+    # Entity list with NPCs and distant mech (> 55m)
     entities = [
         {"id": 101, "kind": "npc", "hp": 350.0, "pos": [50.0, 0.0, 0.0]},    # 50m away (< 90m)
         {"id": 102, "kind": "npc", "hp": 350.0, "pos": [120.0, 0.0, 0.0]},   # 120m away (> 90m)
-        {"id": 5, "kind": "mech", "hp": 800.0, "pos": [30.0, 0.0, 0.0]},
+        {"id": 5, "kind": "mech", "hp": 800.0, "pos": [70.0, 0.0, 0.0]},     # 70m away (> 55m threat radius)
     ]
 
-    # 1. In opening 60s (t = 20s), NPC 101 within 90m is found
+    # 1. In opening 60s (t = 20s), NPC 101 within 90m is found when safe
     target = hunter.find_target(my_pos, entities, current_time=20.0)
     assert target is not None and target["id"] == 101, f"Expected NPC 101, got {target}"
     print("  [PASS] Opening 60s (t=20s): NPC within 90m prioritized for 2 power cubes.")
@@ -307,7 +307,16 @@ def test_npc_hunter():
     assert target_late is None, "Hunter must not target NPCs after 60s window!"
     print("  [PASS] Post-60s window: Hunter automatically deactivates.")
 
-    # 3. Lowest HP priority among multiple NPCs
+    # 3. NPC Safe-Hunting Guard: If enemy player mech within 55m, abort NPC hunting!
+    entities_threat = [
+        {"id": 101, "kind": "npc", "hp": 350.0, "pos": [50.0, 0.0, 0.0]},
+        {"id": 5, "kind": "mech", "hp": 800.0, "pos": [35.0, 0.0, 0.0]},     # 35m away (<= 55m threat!)
+    ]
+    target_threat = hunter.find_target(my_pos, entities_threat, current_time=20.0)
+    assert target_threat is None, "NPC hunt must abort when player mech is within 55m!"
+    print("  [PASS] NPC Safe-Hunting Guard: Aborted NPC hunt due to enemy mech at 35m (<= 55m).")
+
+    # 4. Lowest HP priority among multiple NPCs
     entities_multi = [
         {"id": 101, "kind": "npc", "hp": 350.0, "pos": [40.0, 0.0, 0.0]},
         {"id": 103, "kind": "npc", "hp": 150.0, "pos": [60.0, 0.0, 0.0]},  # Lower HP!
@@ -348,10 +357,11 @@ def test_dynamic_target_scorer():
     print("  [PASS] Front-facing angle detection verified (inside front arc).")
 
     # Score calculation formula test:
-    # Score = (1000 / enemy_hp) + (is_rear_facing * 200) + (is_fighting_others * 150) - (distance * 0.05)
+    # Base Score = (1000 / enemy_hp) + (is_rear_facing * 200) + (is_fighting_others * 150) - (distance * 0.05)
+    # Instant Rear-Shot Execution bonus (+1000.0 if is_rear and hp <= 472.0):
     score_rear = scorer.compute_score(my_pos, rear_enemy)
-    # Expected: (1000 / 300) + (1 * 200) + (1 * 150) - (50 * 0.05) = 3.333 + 200 + 150 - 2.5 = 350.833
-    expected_score_rear = (1000.0 / 300.0) + 200.0 + 150.0 - (50.0 * 0.05)
+    # Expected: (1000 / 300) + 200 + 150 - (50 * 0.05) + 1000 (instant rear execution) = 1350.833
+    expected_score_rear = (1000.0 / 300.0) + 200.0 + 150.0 - (50.0 * 0.05) + 1000.0
     assert abs(score_rear - expected_score_rear) < 0.01, f"Score mismatch: got {score_rear}, expected {expected_score_rear}"
 
     score_front = scorer.compute_score(my_pos, front_enemy)
@@ -414,25 +424,59 @@ def test_select_optimal_target_api():
 
     all_entities = [
         {"id": 101, "kind": "npc", "hp": 350.0, "pos": [50.0, 0.0, 0.0], "aim": [0.0, 0.0]},
-        {"id": 2, "kind": "mech", "hp": 1400.0, "pos": [25.0, 0.0, 0.0], "aim": [math.pi, 0.0]},  # Front facing full HP
-        {"id": 3, "kind": "mech", "hp": 320.0, "pos": [60.0, 0.0, 0.0], "aim": [0.0, 0.0]},        # Rear facing wounded
+        {"id": 2, "kind": "mech", "hp": 1400.0, "pos": [65.0, 0.0, 0.0], "aim": [math.pi, 0.0]},  # Front facing full HP (> 55m safe)
+        {"id": 3, "kind": "mech", "hp": 320.0, "pos": [70.0, 0.0, 0.0], "aim": [0.0, 0.0]},        # Rear facing wounded (> 55m safe)
     ]
 
-    # 1. At t=15s (opening 60s): Must select NPC 101 for economy snowball
+    # 1. At t=15s (opening 60s) with no mechs within 55m: Must select NPC 101 for economy snowball
     t_opt_early = select_optimal_target(my_pos, all_entities, current_time=15.0)
     assert t_opt_early is not None and t_opt_early["id"] == 101, f"Expected NPC 101, got {t_opt_early}"
     print("  [PASS] select_optimal_target at t=15s selects NPC 101 (Economy Snowball).")
 
-    # 2. At t=75s (post 60s): Must select rear-facing wounded mech 3 instead of closer tank 2
+    # 2. At t=15s, but an enemy mech is within 55m: Aborts NPC hunting and targets player mech
+    entities_with_threat = [
+        {"id": 101, "kind": "npc", "hp": 350.0, "pos": [50.0, 0.0, 0.0], "aim": [0.0, 0.0]},
+        {"id": 4, "kind": "mech", "hp": 400.0, "pos": [25.0, 0.0, 0.0], "aim": [0.0, 0.0]},        # Enemy mech within 55m!
+    ]
+    t_opt_threat = select_optimal_target(my_pos, entities_with_threat, current_time=15.0)
+    assert t_opt_threat is not None and t_opt_threat["id"] == 4, f"Expected player Mech 4, got {t_opt_threat}"
+    print("  [PASS] Safe-Hunting Guard verified: Mech within 55m aborts NPC hunt and targets player.")
+
+    # 3. At t=75s (post 60s): Must select rear-facing wounded mech 3 instead of closer tank 2
     t_opt_late = select_optimal_target(my_pos, all_entities, current_time=75.0)
     assert t_opt_late is not None and t_opt_late["id"] == 3, f"Expected rear-facing Mech 3, got {t_opt_late}"
     print("  [PASS] select_optimal_target at t=75s selects rear-facing wounded Mech 3.")
 
-    # 3. Method on ArtillerySystem
+    # 4. Method on ArtillerySystem
     sys_art = ArtillerySystem()
     t_sys = sys_art.select_optimal_target(my_pos, all_entities, current_time=15.0)
     assert t_sys is not None and t_sys["id"] == 101
     print("  [PASS] ArtillerySystem.select_optimal_target method verified.")
+
+
+def test_exact_predictive_lead_calibration():
+    print("\n=== TEST 10: Exact First-Order Predictive Lead Calibration ===")
+    from artillery import compute_exact_predictive_lead, ARM_GUN_SPEED
+    my_pos = [0.0, 0.0, 0.0]
+    target_pos = [100.0, 0.0, 0.0]
+    target_vel = [0.0, 30.0, 0.0]  # Crossing target at 30 m/s
+    res = compute_exact_predictive_lead(my_pos, target_pos, target_vel, bullet_speed=ARM_GUN_SPEED)
+    assert res is not None, "Failed to calculate exact lead!"
+    yaw, pitch, t_lead = res
+    # Verify: bullet flight distance equals distance to predicted position
+    muzzle_z = my_pos[2] + 7.0
+    pred_pos = [
+        target_pos[0] + target_vel[0] * t_lead,
+        target_pos[1] + target_vel[1] * t_lead,
+        target_pos[2] + 4.5 + target_vel[2] * t_lead
+    ]
+    dx = pred_pos[0] - my_pos[0]
+    dy = pred_pos[1] - my_pos[1]
+    dz = pred_pos[2] - muzzle_z
+    flight_dist = math.sqrt(dx*dx + dy*dy + dz*dz)
+    expected_dist = ARM_GUN_SPEED * t_lead
+    assert abs(flight_dist - expected_dist) < 1e-4, f"Lead error: {flight_dist} vs {expected_dist}"
+    print(f"  [PASS] Exact lead: t={t_lead:.4f}s, dist={flight_dist:.2f}m, error={abs(flight_dist - expected_dist):.2e}m")
 
 
 def test_performance_budget():
@@ -517,6 +561,7 @@ if __name__ == "__main__":
     test_dynamic_target_scorer()
     test_laser_lightning_combo()
     test_select_optimal_target_api()
+    test_exact_predictive_lead_calibration()
     test_performance_budget()
     print("\n==================================================================")
     print("ALL TESTS PASSED WITH 100% SUCCESS!")
