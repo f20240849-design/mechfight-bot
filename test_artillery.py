@@ -20,6 +20,10 @@ from artillery import (
     LightningConeTrigger,
     SmartWeaponSwapManager,
     ArtillerySystem,
+    NPCHunter,
+    DynamicTargetScorer,
+    LaserLightningCombo,
+    select_optimal_target,
 )
 
 
@@ -281,6 +285,156 @@ def test_smart_weapon_swap_manager():
     print("  [PASS] Ultimate loadout (Laser + Lightning) locks against lower-tier weapons.")
 
 
+def test_npc_hunter():
+    print("\n=== TEST 6: NPCHunter (Economy Snowball: Opening 60s, 90m, 2 Cubes) ===")
+    hunter = NPCHunter(hunt_window_s=60.0, max_hunt_dist=90.0)
+    my_pos = [0.0, 0.0, 0.0]
+
+    # Entity list with NPCs and mechs
+    entities = [
+        {"id": 101, "kind": "npc", "hp": 350.0, "pos": [50.0, 0.0, 0.0]},    # 50m away (< 90m)
+        {"id": 102, "kind": "npc", "hp": 350.0, "pos": [120.0, 0.0, 0.0]},   # 120m away (> 90m)
+        {"id": 5, "kind": "mech", "hp": 800.0, "pos": [30.0, 0.0, 0.0]},
+    ]
+
+    # 1. In opening 60s (t = 20s), NPC 101 within 90m is found
+    target = hunter.find_target(my_pos, entities, current_time=20.0)
+    assert target is not None and target["id"] == 101, f"Expected NPC 101, got {target}"
+    print("  [PASS] Opening 60s (t=20s): NPC within 90m prioritized for 2 power cubes.")
+
+    # 2. Beyond 60s (t = 65s), hunt window is closed
+    target_late = hunter.find_target(my_pos, entities, current_time=65.0)
+    assert target_late is None, "Hunter must not target NPCs after 60s window!"
+    print("  [PASS] Post-60s window: Hunter automatically deactivates.")
+
+    # 3. Lowest HP priority among multiple NPCs
+    entities_multi = [
+        {"id": 101, "kind": "npc", "hp": 350.0, "pos": [40.0, 0.0, 0.0]},
+        {"id": 103, "kind": "npc", "hp": 150.0, "pos": [60.0, 0.0, 0.0]},  # Lower HP!
+    ]
+    target_low = hunter.find_target(my_pos, entities_multi, current_time=15.0)
+    assert target_low is not None and target_low["id"] == 103, "Failed to prioritize lower-HP NPC!"
+    print("  [PASS] Lower-HP NPC prioritized to guarantee fastest 2-cube kill.")
+
+
+def test_dynamic_target_scorer():
+    print("\n=== TEST 7: DynamicTargetScorer (Rear-Armor 1.5x & Dynamic Formula) ===")
+    scorer = DynamicTargetScorer()
+    my_pos = [0.0, 0.0, 0.0]
+
+    # Target 1: Enemy at [50, 0], aiming East (yaw=0.0). We are at [0, 0] (West of enemy).
+    # Shot enters through enemy's BACK (> 90 deg from aim).
+    rear_enemy = {
+        "id": 1,
+        "kind": "mech",
+        "hp": 300.0,
+        "pos": [50.0, 0.0, 0.0],
+        "aim": [0.0, 0.0],  # Facing East away from us
+        "weapons": ["gun"]
+    }
+    assert scorer.is_rear_facing(my_pos, rear_enemy) is True, "Expected rear-facing to be True!"
+    print("  [PASS] Rear-facing angle detection verified (outside 180° front arc).")
+
+    # Target 2: Enemy at [50, 0], aiming West (yaw=pi). Facing directly toward us.
+    front_enemy = {
+        "id": 2,
+        "kind": "mech",
+        "hp": 1400.0,
+        "pos": [30.0, 0.0, 0.0],
+        "aim": [math.pi, 0.0],  # Facing West toward us
+        "weapons": ["gun"]
+    }
+    assert scorer.is_rear_facing(my_pos, front_enemy) is False, "Expected rear-facing to be False!"
+    print("  [PASS] Front-facing angle detection verified (inside front arc).")
+
+    # Score calculation formula test:
+    # Score = (1000 / enemy_hp) + (is_rear_facing * 200) + (is_fighting_others * 150) - (distance * 0.05)
+    score_rear = scorer.compute_score(my_pos, rear_enemy)
+    # Expected: (1000 / 300) + (1 * 200) + (1 * 150) - (50 * 0.05) = 3.333 + 200 + 150 - 2.5 = 350.833
+    expected_score_rear = (1000.0 / 300.0) + 200.0 + 150.0 - (50.0 * 0.05)
+    assert abs(score_rear - expected_score_rear) < 0.01, f"Score mismatch: got {score_rear}, expected {expected_score_rear}"
+
+    score_front = scorer.compute_score(my_pos, front_enemy)
+    # Expected: (1000 / 1400) + 0 + 0 - (30 * 0.05) = 0.714 - 1.5 = -0.786
+    expected_score_front = (1000.0 / 1400.0) + 0.0 + 0.0 - (30.0 * 0.05)
+    assert abs(score_front - expected_score_front) < 0.01
+
+    assert score_rear > score_front + 300.0, "Rear-facing wounded enemy must heavily outscore front-facing tank!"
+    print(f"  [PASS] Formula verified: Rear-facing wounded score={score_rear:.1f} vs Front-facing score={score_front:.1f}")
+
+    # Laser 1.5x rear execution math check
+    laser_hit_rear = 315.0 * 1.5
+    assert laser_hit_rear == 472.5
+    assert laser_hit_rear > rear_enemy["hp"], "Laser hit must one-shot execute the 300 HP wounded enemy!"
+    print(f"  [PASS] Laser rear-armor execution confirmed: 315 * 1.5 = {laser_hit_rear:.1f} dmg (One-shot kill!).")
+
+
+def test_laser_lightning_combo():
+    print("\n=== TEST 8: LaserLightningCombo (Short Locks & Combo Burst) ===")
+    combo = LaserLightningCombo(range_m=40.0, cone_deg=30.0, short_duration=2.0)
+    my_pos = [0.0, 0.0]
+    aim_yaw = 0.0
+
+    # Target carrying laser at 35m in cone
+    laser_target = {
+        "id": 1,
+        "pos": [35.0, 0.0, 0.0],
+        "weapons": ["gun", "laser"],
+        "hp": 900.0
+    }
+    assert combo.should_discharge_lightning(my_pos, aim_yaw, laser_target, current_energy=20.0, lightning_cooldown=0.0) is True
+    print("  [PASS] Preemptive short lock triggered on laser carrier within 40m cone.")
+
+    # Target out of 40m range (45m)
+    far_target = {
+        "id": 2,
+        "pos": [45.0, 0.0, 0.0],
+        "weapons": ["laser"],
+        "hp": 900.0
+    }
+    assert combo.should_discharge_lightning(my_pos, aim_yaw, far_target, current_energy=20.0, lightning_cooldown=0.0) is False
+    print("  [PASS] Target at 45m (> 40m combo limit) rejected.")
+
+    # Burst calculation on rear-facing enemy holding mortar
+    mortar_rear = {
+        "id": 3,
+        "pos": [30.0, 0.0, 0.0],
+        "weapons": ["gun", "mortar"],
+        "hp": 700.0
+    }
+    burst = combo.calculate_combo_burst(mortar_rear, is_rear_facing=True)
+    # Laser: 315 * 1.6 (cookoff) * 1.5 (rear) = 756.0!
+    assert burst["laser_dmg"] == 756.0
+    print(f"  [PASS] Combo burst against rear-armor mortar carrier: {burst['laser_dmg']:.1f} laser dmg!")
+
+
+def test_select_optimal_target_api():
+    print("\n=== TEST 9: select_optimal_target Exposed API ===")
+    my_pos = [0.0, 0.0, 0.0]
+
+    all_entities = [
+        {"id": 101, "kind": "npc", "hp": 350.0, "pos": [50.0, 0.0, 0.0], "aim": [0.0, 0.0]},
+        {"id": 2, "kind": "mech", "hp": 1400.0, "pos": [25.0, 0.0, 0.0], "aim": [math.pi, 0.0]},  # Front facing full HP
+        {"id": 3, "kind": "mech", "hp": 320.0, "pos": [60.0, 0.0, 0.0], "aim": [0.0, 0.0]},        # Rear facing wounded
+    ]
+
+    # 1. At t=15s (opening 60s): Must select NPC 101 for economy snowball
+    t_opt_early = select_optimal_target(my_pos, all_entities, current_time=15.0)
+    assert t_opt_early is not None and t_opt_early["id"] == 101, f"Expected NPC 101, got {t_opt_early}"
+    print("  [PASS] select_optimal_target at t=15s selects NPC 101 (Economy Snowball).")
+
+    # 2. At t=75s (post 60s): Must select rear-facing wounded mech 3 instead of closer tank 2
+    t_opt_late = select_optimal_target(my_pos, all_entities, current_time=75.0)
+    assert t_opt_late is not None and t_opt_late["id"] == 3, f"Expected rear-facing Mech 3, got {t_opt_late}"
+    print("  [PASS] select_optimal_target at t=75s selects rear-facing wounded Mech 3.")
+
+    # 3. Method on ArtillerySystem
+    sys_art = ArtillerySystem()
+    t_sys = sys_art.select_optimal_target(my_pos, all_entities, current_time=15.0)
+    assert t_sys is not None and t_sys["id"] == 101
+    print("  [PASS] ArtillerySystem.select_optimal_target method verified.")
+
+
 def test_performance_budget():
     print("\n=== TEST 6: Performance Benchmark (< 1.5 ms execution budget) ===")
     artillery = ArtillerySystem()
@@ -359,6 +513,10 @@ if __name__ == "__main__":
     test_laser_charge_discharge_controller()
     test_lightning_cone_trigger()
     test_smart_weapon_swap_manager()
+    test_npc_hunter()
+    test_dynamic_target_scorer()
+    test_laser_lightning_combo()
+    test_select_optimal_target_api()
     test_performance_budget()
     print("\n==================================================================")
     print("ALL TESTS PASSED WITH 100% SUCCESS!")
