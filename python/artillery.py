@@ -1,6 +1,6 @@
 """
 Artillery, Ballistics, and Weapon Triangle Systems for MechRoyale (mechfight/1).
-Author: BALLIS - Weapon Triangle & Indirect Artillery Engineer
+Author: BALLIS - Weapon Triangle & Indirect Artillery Engineer / Economy Snowball & Rear-Armor Executioner
 
 Key Subsystems:
 1. IndirectParabolicMortarSolver (ArtillerySolver):
@@ -16,6 +16,16 @@ Key Subsystems:
 4. SmartWeaponSwapManager:
    - Strictly enforces invariant: Never drop the Arm Gun unless holding Laser AND finding Lightning (or vice versa).
    - Triangle-aware weapon picking, cooldown/equip timer management.
+5. NPCHunter:
+   - In opening 60s (t < 60s), prioritizes roaming NPCs (350 HP, 5 m/s) within 90m.
+   - Executes with Laser + Arm Gun burst for instant 2 Power Cubes harvest (+8% HP & Dmg).
+6. DynamicTargetScorer:
+   - Formula: Score = (1000 / enemy_hp) + (is_rear_facing * 200) + (is_fighting_others * 150) - (distance * 0.05).
+   - Targets lowest-HP brawlers whose back is turned (rear armor takes 1.5x damage = 472.5 laser dmg!).
+7. LaserLightningCombo:
+   - Discharges Lightning within 40m to apply short_s: 2.0 (locks enemy Lasers offline for 2.0s).
+8. select_optimal_target:
+   - Unified API: (my_pos, visible_mechs, current_time) -> Optional[Dict[str, Any]].
 """
 
 import math
@@ -641,6 +651,292 @@ class LightningConeTrigger:
         return valid[0][1]
 
 
+class NPCHunter:
+    """
+    Early-game Economy Snowball Engine.
+    
+    Doctrines:
+    - 12 NPCs roam the arena with 350 HP, moving at ~5 m/s.
+    - Each NPC drops 2 Power Cubes upon destruction (+8% HP & Damage, upgrade progression).
+    - In the opening 60 seconds (t < 60s), any NPC within 90m (hp <= 350) is prioritized.
+    - Laser (315 hitscan dmg) + Arm Gun (45 dmg) burst delivers an instantaneous 360 dmg kill!
+    """
+
+    def __init__(self, hunt_window_s: float = 60.0, max_hunt_dist: float = 90.0):
+        self.hunt_window_s = hunt_window_s
+        self.max_hunt_dist = max_hunt_dist
+
+    def find_target(
+        self,
+        my_pos: Union[List[float], Tuple[float, ...]],
+        visible_entities: List[Dict[str, Any]],
+        current_time: float
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Scans visible entities. If current_time < 60s, returns the prioritized NPC
+        (kind == 'npc', hp <= 350) within 90m.
+        """
+        if current_time >= self.hunt_window_s:
+            return None
+
+        mx, my = my_pos[0], my_pos[1]
+        candidates = []
+        for e in visible_entities:
+            if e.get("kind") == "npc":
+                hp = float(e.get("hp", 350.0))
+                if hp <= 350.0:
+                    ep = e.get("pos", [0, 0, 0])
+                    dist = math.hypot(ep[0] - mx, ep[1] - my)
+                    if dist <= self.max_hunt_dist:
+                        # Prioritize lowest HP, then closest distance
+                        candidates.append((hp, dist, e))
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda c: (c[0], c[1]))
+        return candidates[0][2]
+
+
+class DynamicTargetScorer:
+    """
+    Dynamic Target Scorer & Rear-Armor Executioner.
+    
+    Formula:
+        Score = (1000.0 / enemy_hp) + (is_rear_facing * 200.0) + (is_fighting_others * 150.0) - (distance * 0.05)
+    
+    Doctrines:
+    - Eliminates naive 'closest enemy' targeting.
+    - Rear armor takes 1.5x damage (+50% bonus). Firing a Laser (315 dmg) at rear armor
+      inflicts 472.5 damage—an instant one-shot execution on wounded brawlers.
+    - Prioritizes brawlers occupied fighting third parties.
+    """
+
+    def __init__(self):
+        pass
+
+    def is_rear_facing(
+        self,
+        my_pos: Union[List[float], Tuple[float, ...]],
+        target: Dict[str, Any]
+    ) -> bool:
+        """
+        Checks if our shot enters through the target's rear armor (> 90 deg from their aim yaw).
+        In protocol.md §7: Front arc is 180 deg centered on torso aim yaw.
+        Outside this 180 deg front arc (|bearing_to_us - aim_yaw| > 90 deg) is rear armor (1.5x damage).
+        """
+        t_pos = target.get("pos", [0, 0, 0])
+        dx = my_pos[0] - t_pos[0]
+        dy = my_pos[1] - t_pos[1]
+        bearing_to_us = math.atan2(dy, dx)
+
+        target_aim = target.get("aim", [0.0, 0.0])
+        target_yaw = target_aim[0] if isinstance(target_aim, (list, tuple)) and len(target_aim) > 0 else 0.0
+
+        angle_diff = math.atan2(math.sin(bearing_to_us - target_yaw), math.cos(bearing_to_us - target_yaw))
+        return abs(angle_diff) > (math.pi / 2.0)
+
+    def is_fighting_others(
+        self,
+        my_pos: Union[List[float], Tuple[float, ...]],
+        target: Dict[str, Any],
+        all_mechs: Optional[List[Dict[str, Any]]] = None
+    ) -> bool:
+        """
+        Checks if the target is aiming away from us (> 45 deg) or actively brawling with another mech.
+        """
+        t_pos = target.get("pos", [0, 0, 0])
+        dx = my_pos[0] - t_pos[0]
+        dy = my_pos[1] - t_pos[1]
+        bearing_to_us = math.atan2(dy, dx)
+
+        target_aim = target.get("aim", [0.0, 0.0])
+        target_yaw = target_aim[0] if isinstance(target_aim, (list, tuple)) and len(target_aim) > 0 else 0.0
+
+        angle_diff = math.atan2(math.sin(bearing_to_us - target_yaw), math.cos(bearing_to_us - target_yaw))
+
+        # 1. Torso aimed > 45 degrees away from us
+        if abs(angle_diff) > (math.pi / 4.0):
+            return True
+
+        # 2. Charging a laser while not aimed directly at us
+        if target.get("charging", False) and abs(angle_diff) > (math.pi / 6.0):
+            return True
+
+        # 3. Proximity to another mech/npc that target is aimed at
+        if all_mechs:
+            for m in all_mechs:
+                if m.get("id") != target.get("id"):
+                    mp = m.get("pos", [0, 0, 0])
+                    dist_tm = math.hypot(mp[0] - t_pos[0], mp[1] - t_pos[1])
+                    if dist_tm < 45.0:
+                        bearing_to_m = math.atan2(mp[1] - t_pos[1], mp[0] - t_pos[0])
+                        diff_m = math.atan2(math.sin(bearing_to_m - target_yaw), math.cos(bearing_to_m - target_yaw))
+                        if abs(diff_m) < (math.pi / 4.0):
+                            return True
+
+        return False
+
+    def compute_score(
+        self,
+        my_pos: Union[List[float], Tuple[float, ...]],
+        target: Dict[str, Any],
+        all_mechs: Optional[List[Dict[str, Any]]] = None
+    ) -> float:
+        """
+        Computes score per the mission spec:
+            Score = (1000.0 / enemy_hp) + (is_rear_facing * 200.0) + (is_fighting_others * 150.0) - (distance * 0.05)
+        """
+        hp = max(1.0, float(target.get("hp", 1000.0)))
+        t_pos = target.get("pos", [0, 0, 0])
+        dist = math.hypot(t_pos[0] - my_pos[0], t_pos[1] - my_pos[1])
+
+        rear_val = 1.0 if self.is_rear_facing(my_pos, target) else 0.0
+        fighting_val = 1.0 if self.is_fighting_others(my_pos, target, all_mechs) else 0.0
+
+        score = (1000.0 / hp) + (rear_val * 200.0) + (fighting_val * 150.0) - (dist * 0.05)
+        return score
+
+    def rank_targets(
+        self,
+        my_pos: Union[List[float], Tuple[float, ...]],
+        targets: List[Dict[str, Any]]
+    ) -> List[Tuple[float, Dict[str, Any]]]:
+        scored = []
+        for t in targets:
+            if t.get("hp", 0) > 0:
+                s = self.compute_score(my_pos, t, targets)
+                scored.append((s, t))
+        scored.sort(key=lambda item: item[0], reverse=True)
+        return scored
+
+
+class LaserLightningCombo:
+    """
+    Laser + Lightning Weapon Triangle Disruptor & Finisher.
+    
+    Doctrines:
+    1. Preemptive Short (Triangle Defense):
+       When within 40m of an enemy, discharge Lightning to apply 'short_s: 2.0'.
+       This locks enemy Lasers offline for 2.0s, wipes their charge in progress,
+       and protects us from lethal 315-504 damage laser shots.
+    2. Rear-Armor Execution:
+       Follow up with Hitscan Laser (315 dmg base, 472.5 dmg to rear armor)
+       or continuous 240 DPS Lightning bursts to eliminate the disabled target.
+    """
+
+    def __init__(
+        self,
+        range_m: float = 40.0,
+        cone_deg: float = 30.0,
+        short_duration: float = 2.0
+    ):
+        self.range_m = range_m
+        self.half_cone_rad = math.radians(cone_deg / 2.0)
+        self.short_duration = short_duration
+
+    def should_discharge_lightning(
+        self,
+        my_pos: Union[List[float], Tuple[float, ...]],
+        aim_yaw: float,
+        target: Dict[str, Any],
+        current_energy: float,
+        lightning_cooldown: float = 0.0
+    ) -> bool:
+        """
+        Evaluates whether Lightning should fire to apply short_s: 2.0 to the target.
+        - Enemy is within 40m and within the 30° cone.
+        - Target carries Laser, or is charging, or general close combat.
+        - Energy >= 3.0 and cooldown <= 0.05s.
+        """
+        if current_energy < 3.0 or lightning_cooldown > 0.05:
+            return False
+
+        t_pos = target.get("pos", [0, 0, 0])
+        dx = t_pos[0] - my_pos[0]
+        dy = t_pos[1] - my_pos[1]
+        dist = math.hypot(dx, dy)
+        if dist > self.range_m:
+            return False
+
+        target_bearing = math.atan2(dy, dx)
+        diff = math.atan2(math.sin(target_bearing - aim_yaw), math.cos(target_bearing - aim_yaw))
+        if abs(diff) > self.half_cone_rad:
+            return False
+
+        return True
+
+    def calculate_combo_burst(
+        self,
+        target: Dict[str, Any],
+        is_rear_facing: bool = False
+    ) -> Dict[str, float]:
+        """
+        Estimates total burst damage:
+        - Lightning: 60 dmg (costs 3 energy, applies 2.0s short)
+        - Laser: 315 dmg base (472.5 rear armor, 504.0 vs mortar, 756.0 rear + mortar)
+        - Arm Gun: 45 dmg
+        """
+        target_weapons = target.get("weapons", [])
+        has_mortar = "mortar" in target_weapons
+        laser_base = 315.0 * (1.6 if has_mortar else 1.0)
+        laser_dmg = laser_base * (1.5 if is_rear_facing else 1.0)
+        lightning_dmg = 60.0 * (1.5 if is_rear_facing else 1.0)
+        gun_dmg = 45.0 * (1.5 if is_rear_facing else 1.0)
+
+        return {
+            "lightning_dmg": lightning_dmg,
+            "laser_dmg": laser_dmg,
+            "gun_dmg": gun_dmg,
+            "total_combo": lightning_dmg + laser_dmg + gun_dmg,
+            "shorts_laser": "laser" in target_weapons or target.get("charging", False)
+        }
+
+
+def select_optimal_target(
+    my_pos: Union[List[float], Tuple[float, ...]],
+    visible_mechs: List[Dict[str, Any]],
+    current_time: float
+) -> Optional[Dict[str, Any]]:
+    """
+    Selects the optimal combat target following BALLIS doctrines:
+    1. NPCHunter: Opening 60 seconds (current_time < 60s), if an NPC (kind == 'npc', hp <= 350)
+       is within 90m, prioritize it for power cube harvesting (2 cubes).
+    2. DynamicTargetScorer: Otherwise, scores all visible enemies:
+       Score = (1000 / enemy_hp) + (is_rear_facing * 200) + (is_fighting_others * 150) - (distance * 0.05)
+       Targets the lowest-HP enemy whose back is turned.
+    """
+    if not visible_mechs:
+        return None
+
+    # 1. NPCHunter check during the opening 60 seconds (only if no player mech is threatening within 55m)
+    nearby_mechs = [
+        m for m in visible_mechs
+        if m.get("kind") == "mech" and m.get("hp", 0) > 0 and math.hypot(m["pos"][0] - my_pos[0], m["pos"][1] - my_pos[1]) < 55.0
+    ]
+    if current_time < 60.0 and not nearby_mechs:
+        hunter = NPCHunter(hunt_window_s=60.0, max_hunt_dist=90.0)
+        npc_target = hunter.find_target(my_pos, visible_mechs, current_time)
+        if npc_target is not None:
+            return npc_target
+
+    # 2. DynamicTargetScorer evaluation
+    scorer = DynamicTargetScorer()
+    living_targets = [m for m in visible_mechs if m.get("hp", 0) > 0]
+    if not living_targets:
+        return None
+
+    # Separate mechs from npcs if mechs are present
+    mechs = [m for m in living_targets if m.get("kind") != "npc"]
+    candidates = mechs if mechs else living_targets
+
+    ranked = scorer.rank_targets(my_pos, candidates)
+    if ranked:
+        return ranked[0][1]
+
+    return None
+
+
 class SmartWeaponSwapManager:
     """
     Smart Weapon Swap Manager.
@@ -827,10 +1123,24 @@ class ArtillerySystem:
 
         self.swap_manager = SmartWeaponSwapManager()
 
+        # BALLIS Economy Snowball & Rear-Armor Execution Engines
+        self.npc_hunter = NPCHunter()
+        self.target_scorer = DynamicTargetScorer()
+        self.combo = LaserLightningCombo()
+
         # Telemetry / execution stats
         self.total_evals = 0
         self.total_time_ms = 0.0
         self.max_time_ms = 0.0
+
+    def select_optimal_target(
+        self,
+        my_pos: Union[List[float], Tuple[float, ...]],
+        visible_mechs: List[Dict[str, Any]],
+        current_time: float
+    ) -> Optional[Dict[str, Any]]:
+        """Exposed method for selecting optimal target (NPCHunter opening + DynamicTargetScorer)."""
+        return select_optimal_target(my_pos, visible_mechs, current_time)
 
     def evaluate_combat_tick(
         self,
@@ -851,6 +1161,8 @@ class ArtillerySystem:
         - 'aim': [yaw, pitch]
         - 'loot_action': Optional[Dict[str, Any]] (take/drop)
         - 'tactical_move': str ('HOLD_COVER', 'PEEK_OUT', 'RETREAT_TO_COVER', 'STANDARD')
+        - 'is_rear_facing': bool
+        - 'target': Optional[Dict[str, Any]]
         - 'execution_time_ms': float
         """
         t_start = time.perf_counter()
@@ -860,9 +1172,14 @@ class ArtillerySystem:
         weapons = me.get("weapons", [None, None])
         energy = me.get("energy", 100.0)
 
+        # Auto-select optimal target if none was provided
+        if target is None and all_enemies:
+            target = self.select_optimal_target(my_pos, all_enemies, current_time)
+
         result_fire = [False, False]
         result_aim = [aim[0], aim[1]]
         tactical_move = "STANDARD"
+        is_rear = False
 
         # 1. Smart Loot Swaps
         loot_action = self.swap_manager.evaluate_swap(me, pickups, all_enemies, current_time)
@@ -896,6 +1213,7 @@ class ArtillerySystem:
 
         # 3. Direct Target Combat
         if target:
+            is_rear = self.target_scorer.is_rear_facing(my_pos, target)
             t_pos = target.get("pos", [0, 0, 0])
             t_dist = math.hypot(t_pos[0] - my_pos[0], t_pos[1] - my_pos[1])
             target_weapons = target.get("weapons", [])
@@ -920,7 +1238,9 @@ class ArtillerySystem:
 
                 # --- Weapon: Lightning ---
                 elif w_kind == "lightning":
-                    if self.lightning.should_fire(my_pos, aim[0], t_pos, energy, w_cd):
+                    # LaserLightningCombo: discharge within 40m cone to apply short_s: 2.0 (locks enemy laser offline)
+                    if self.combo.should_discharge_lightning(my_pos, aim[0], target, energy, w_cd) or \
+                       self.lightning.should_fire(my_pos, aim[0], t_pos, energy, w_cd):
                         result_fire[slot_idx] = True
                         tactical_move = "LIGHTNING_ENGAGE"
 
@@ -952,5 +1272,7 @@ class ArtillerySystem:
             "aim": result_aim,
             "loot_action": loot_action,
             "tactical_move": tactical_move,
+            "is_rear_facing": is_rear,
+            "target": target,
             "execution_time_ms": exec_ms
         }

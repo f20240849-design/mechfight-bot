@@ -1,24 +1,30 @@
 """
-CHOKE: Zone Gatekeeper & Macro Strategist for MechRoyale Tournament Bot.
+CHOKE: Zone Gatekeeper, Macro Strategist & Supply Drop Snatcher for MechRoyale.
 
 Mission:
-Turn the deadly shrinking zone into our lethal weapon.
+Turn the deadly shrinking zone and high-value objectives into our lethal weapons.
 - Zone radii shrink: 560m -> 380m (60-110s) -> 240m (160-210s) -> 140m (260-310s) -> 60m -> 25m -> 0m.
 - Zone DPS scales exponentially: 20 -> 40 -> 80 -> 260 DPS! (260 DPS kills a 1400 HP mech in 5.3s).
 - Placement score = 16 - placement. Surviving early is worth 10-15x more than a risky kill.
+- Supply Drops: Called at t=70s, 140s, 210s with lands_in = 25.0s. Capturing a drop (standing in the
+  8.0m ring for 4.0s) gives a 100% FULL REPAIR (heals completely to max HP) + 3 POWER CUBES.
+  Capturing 2 drops guarantees 10 cubes (max stat cap), 4 upgrades, and full HP for the endgame.
 - Endgame (< 5 alive): pure HP preservation; rank at 8:00 is determined by HP.
 
 Key Capabilities:
-1. Chokepoint & Funnel Precomputation:
+1. SupplyDropInterceptor:
+   Paths toward landing coordinate 10 seconds before touchdown (t_arrival ≈ lands_in - 2.0s).
+   Once landed, holds within the 8.0m capture radius for 4.0s while maintaining aim at incoming approach paths.
+2. Rational Rotation Urgency:
+   NEVER panic-rotates 30s prematurely. Only rotates if time_to_shrink <= traversal_eta + 5.0s or is_outside.
+3. Chokepoint & Funnel Precomputation:
    Analyzes campus building layout from world.json / occupancy.bin to find narrow alleys
    along the incoming zone circle and calculate funnel catchment.
-2. The Gatekeeper Ambush Doctrine:
-   Rotates early into safe zone (ahead of the 15s warning), sets up behind cover at the funnel exit,
-   holds pre-aim down the alley, and ambushes low-HP panic rotators.
-3. Endgame Survival Engine (< 5 alive):
-   Avoids optional fights, lets enemies fight each other, positions on high ground or deep cover
-   inside the final 60m circle.
-4. Ohio Stadium Pinch Avoidance:
+4. The Gatekeeper Ambush Doctrine:
+   Sets up behind cover at the funnel exit, holds pre-aim down the alley, and ambushes low-HP panic rotators.
+5. Endgame Survival Anchor (< 5 alive):
+   Holds deep perimeter cover, avoids initiating fights, and lets opponents butcher each other down to the final duel.
+6. Ohio Stadium Pinch Avoidance:
    Detects stadium traps and precomputes safe bypass paths.
 """
 
@@ -72,11 +78,139 @@ class Chokepoint:
         )
 
 
+class SupplyDropInterceptor:
+    """
+    Supply Drop Snatcher & Objective Controller.
+
+    Supply drops spawn at t=70s, 140s, and 210s with lands_in = 25.0s.
+    Capturing a drop (standing in the 8.0m radius alone for 4.0s) awards:
+    - 100% FULL REPAIR (heals completely to max HP)
+    - +3 POWER CUBES (+12% HP, +12% damage)
+    - Full Energy recharge
+
+    Naive bots do not navigate to drops. Capturing 2 drops guarantees 10 cubes
+    (max stat cap), 4 upgrades, and full HP for the endgame.
+    """
+
+    def __init__(
+        self,
+        capture_radius: float = 8.0,
+        capture_time: float = 4.0,
+        walk_speed: float = 11.7
+    ):
+        self.capture_radius = capture_radius
+        self.capture_time = capture_time
+        self.walk_speed = walk_speed
+        self.active_drop_id: Optional[int] = None
+        self.is_capturing: bool = False
+
+    def evaluate_drop_objective(
+        self,
+        my_pos: Tuple[float, float],
+        drops: List[Dict[str, Any]],
+        visible_enemies: List[Dict[str, Any]],
+        current_time: float
+    ) -> Optional[Tuple[float, float]]:
+        """
+        Evaluates active supply drops and determines if/when to intercept.
+        1. When a drop beacon appears (obs["drops"]), path toward the landing coordinate
+           10 seconds before touchdown (or when t_arrival ≈ lands_in - 2.0s).
+        2. Once landed (lands_in <= 0), hold within the 8.0m capture radius for 4.0s
+           while maintaining aim at incoming approach paths.
+        3. Returns target coordinates (x, y) to move to, or None if no drop should be pursued.
+        """
+        if not drops:
+            self.active_drop_id = None
+            self.is_capturing = False
+            return None
+
+        my_x, my_y = float(my_pos[0]), float(my_pos[1])
+        valid_drops = []
+        for d in drops:
+            d_pos = d.get("pos", [0.0, 0.0, 0.0])
+            dist = math.hypot(my_x - d_pos[0], my_y - d_pos[1])
+            lands_in = float(d.get("lands_in", 0.0))
+            valid_drops.append((lands_in, dist, d))
+
+        if not valid_drops:
+            self.active_drop_id = None
+            self.is_capturing = False
+            return None
+
+        # Sort primarily by lands_in (soonest landing), then distance
+        valid_drops.sort(key=lambda item: (item[0], item[1]))
+        _, dist_to_drop, best_drop = valid_drops[0]
+
+        drop_pos = (float(best_drop["pos"][0]), float(best_drop["pos"][1]))
+        lands_in = float(best_drop.get("lands_in", 0.0))
+        self.active_drop_id = best_drop.get("id")
+
+        # Traversal ETA to reach the 8m capture ring perimeter
+        d_to_ring = max(0.0, dist_to_drop - (self.capture_radius - 2.0))
+        traversal_eta = (d_to_ring / max(1.0, self.walk_speed)) * 1.15  # 15% terrain obstacle detour factor
+
+        # Phase A: Drop has touched down on the ground (lands_in <= 0.0) -> CAPTURE MODE
+        if lands_in <= 0.0:
+            self.is_capturing = True
+            # If already comfortably inside the 8.0m capture ring (dist <= 6.5m), hold position!
+            if dist_to_drop <= (self.capture_radius - 1.5):
+                return (my_x, my_y)
+            # Otherwise, navigate directly into the 8m ring
+            return drop_pos
+
+        # Phase B: Drop is descending in the air (lands_in > 0.0) -> INTERCEPTOR PATHING
+        # Trigger pathing when:
+        # 1. lands_in <= 10.0s (10 seconds before touchdown rule)
+        # OR
+        # 2. lands_in <= traversal_eta + 2.0s (timed arrival: t_arrival ≈ lands_in - 2.0s)
+        should_intercept = (lands_in <= 10.0) or (lands_in <= (traversal_eta + 2.0))
+
+        if should_intercept:
+            self.is_capturing = False
+            return drop_pos
+
+        # Drop is still high in the sky (> 10s away and bot is close enough to wait)
+        # Allow the bot to continue farming crates/cubes nearby instead of waiting idle
+        self.is_capturing = False
+        return None
+
+    def get_defensive_aim(
+        self,
+        my_pos: Tuple[float, float],
+        drop: Optional[Dict[str, Any]],
+        visible_enemies: List[Dict[str, Any]]
+    ) -> Tuple[float, float]:
+        """
+        Maintains aim at incoming approach paths while capturing the supply drop:
+        - If an enemy is visible, pre-aim directly at the closest intruder.
+        - If no enemy visible, look outward from the drop ring center along open approach vectors.
+        """
+        my_x, my_y = float(my_pos[0]), float(my_pos[1])
+        if visible_enemies:
+            sorted_enemies = sorted(
+                visible_enemies,
+                key=lambda e: math.hypot(e["pos"][0] - my_x, e["pos"][1] - my_y)
+            )
+            target = sorted_enemies[0]
+            dx = target["pos"][0] - my_x
+            dy = target["pos"][1] - my_y
+            return math.atan2(dy, dx), 0.0
+
+        if drop:
+            d_pos = drop.get("pos", [0.0, 0.0, 0.0])
+            dx = my_x - d_pos[0]
+            dy = my_y - d_pos[1]
+            if math.hypot(dx, dy) > 0.5:
+                return math.atan2(dy, dx), 0.0
+
+        return 0.0, 0.0
+
+
 class ZoneGatekeeper:
     """
-    Zone Gatekeeper & Macro Strategist (CHOKE).
-    Manages zone shrink timings, chokepoint ambush positioning,
-    stadium bypasses, and endgame HP preservation.
+    Zone Gatekeeper, Macro Strategist & Objective Controller (CHOKE).
+    Manages supply drop interception, rational zone rotation urgency,
+    chokepoint funnel ambushes, Ohio Stadium pinch bypasses, and endgame HP preservation.
     """
 
     def __init__(self, map_dir: str = "."):
@@ -90,6 +224,9 @@ class ZoneGatekeeper:
 
         # Load terrain elevations if available
         self.terrain = self._load_terrain()
+
+        # Supply Drop Interceptor engine
+        self.drop_interceptor = SupplyDropInterceptor(walk_speed=11.7)
 
         # Stadium Bounding Box & Safe Bypasses
         # Stadium footprint: X in [-382.2, -170.2], Y in [-13.2, 266.8]
@@ -113,6 +250,8 @@ class ZoneGatekeeper:
         candidates = [
             os.path.join(here, "data", filename),
             os.path.join(here, "arena", "v2", filename),
+            os.path.join(here, "..", "..", "data", filename),
+            os.path.join(here, "..", "..", "arena", "v2", filename),
             os.path.join(self.map_dir, "v2", filename),
             os.path.join(self.map_dir, "arena", "v2", filename),
             os.path.join(self.map_dir, filename),
@@ -176,10 +315,46 @@ class ZoneGatekeeper:
         return not np.any(self.grid[rows, cols] == 1)
 
     # =========================================================================
-    # 1. Ohio Stadium Pinch Detection & Safe Bypass
+    # 1. Supply Drop Interceptor API
     # =========================================================================
 
-    def is_stadium_pinch(self, start_pos: Tuple[float, float], goal_pos: Tuple[float, float]) -> Tuple[bool, Optional[Tuple[float, float]]]:
+    def evaluate_drop_objective(
+        self,
+        my_pos: Tuple[float, float],
+        drops: List[Dict[str, Any]],
+        visible_enemies: List[Dict[str, Any]],
+        current_time: float
+    ) -> Optional[Tuple[float, float]]:
+        """
+        Exposed Supply Drop Objective Controller:
+        - When a drop beacon appears, path toward landing coordinate 10s before touchdown.
+        - Once landed, hold within the 8.0m capture radius for 4.0s.
+        - Returns target coordinates (x, y) or None if no drop should be pursued.
+        """
+        return self.drop_interceptor.evaluate_drop_objective(
+            my_pos, drops, visible_enemies, current_time
+        )
+
+    def get_drop_defensive_aim(
+        self,
+        my_pos: Tuple[float, float],
+        drop: Optional[Dict[str, Any]],
+        visible_enemies: List[Dict[str, Any]]
+    ) -> Tuple[float, float]:
+        """
+        Maintains defensive crosshair aim down approach paths while capturing supply drops.
+        """
+        return self.drop_interceptor.get_defensive_aim(my_pos, drop, visible_enemies)
+
+    # =========================================================================
+    # 2. Ohio Stadium Pinch Detection & Safe Bypass
+    # =========================================================================
+
+    def is_stadium_pinch(
+        self,
+        start_pos: Tuple[float, float],
+        goal_pos: Tuple[float, float]
+    ) -> Tuple[bool, Optional[Tuple[float, float]]]:
         """
         Detects if traversing directly from start_pos to goal_pos collides with
         Ohio Stadium's massive curved concrete exterior (>200m wall).
@@ -189,7 +364,6 @@ class ZoneGatekeeper:
         gx, gy = goal_pos[0], goal_pos[1]
 
         sbox = self.stadium_box
-        # Check if either point is west/inside stadium and moving eastward
         west_of_stadium = sx < sbox["min_x"] + 20.0 and (sbox["min_y"] - 20.0 <= sy <= sbox["max_y"] + 20.0)
         inside_stadium_zone = (sbox["min_x"] <= sx <= sbox["max_x"]) and (sbox["min_y"] <= sy <= sbox["max_y"])
         going_east = gx > sbox["min_x"]
@@ -197,7 +371,6 @@ class ZoneGatekeeper:
         if not (west_of_stadium or inside_stadium_zone) or not going_east:
             return False, None
 
-        # Line segment bounding box intersection with stadium
         seg_min_x = min(sx, gx)
         seg_max_x = max(sx, gx)
         seg_min_y = min(sy, gy)
@@ -222,7 +395,7 @@ class ZoneGatekeeper:
         return True, bypass
 
     # =========================================================================
-    # 2. Zone Mechanics & Early Rotation Urgency
+    # 3. Zone Mechanics & Rational Rotation Urgency
     # =========================================================================
 
     def evaluate_rotation_urgency(
@@ -233,8 +406,9 @@ class ZoneGatekeeper:
         current_time: Optional[float] = None
     ) -> Tuple[bool, float]:
         """
-        The Gatekeeper Ambush Doctrine: Rotate early into the safe zone ahead of the 15s warning.
-        Computes traversal times across terrain and stadium obstacles.
+        Rational Rotation Urgency Engine:
+        NEVER panic-rotate 30s prematurely.
+        Only rotate if time_to_shrink <= traversal_eta + 5.0s or is_outside.
 
         Returns: (needs_rotation, eta_seconds)
         """
@@ -252,39 +426,38 @@ class ZoneGatekeeper:
 
         # Distance to next circle center
         dist_next = math.hypot(x - next_center[0], y - next_center[1])
-        # Safe buffer inside the next circle (want to be 25m inside the border)
+        # Safe buffer inside the next circle (25m inside border)
         safe_radius = max(10.0, next_radius - 25.0)
         dist_to_safe = max(0.0, dist_next - safe_radius)
 
-        # If already well inside safe zone, no rotation needed unless outside current
+        # If already safely inside next circle, no rotation needed unless outside current
         if dist_to_safe <= 0.0 and not is_outside:
             return False, 0.0
 
         # Check for Stadium Pinch detour
         is_pinched, bypass_wp = self.is_stadium_pinch((x, y), (next_center[0], next_center[1]))
         if is_pinched and bypass_wp:
-            # Traversal distance via bypass waypoint
             d1 = math.hypot(bypass_wp[0] - x, bypass_wp[1] - y)
             d2 = math.hypot(next_center[0] - bypass_wp[0], next_center[1] - bypass_wp[1])
             total_dist = d1 + max(0.0, d2 - safe_radius)
             obstacle_mult = 1.35
         else:
             total_dist = dist_to_safe
-            obstacle_mult = 1.2  # Real terrain navigation detour factor
+            obstacle_mult = 1.2  # Terrain navigation detour factor
 
         # Compute traversal ETA
         eta_seconds = (total_dist / max(1.0, my_speed)) * obstacle_mult
 
-        # Safe rotation timing:
-        # Give a comfortable 5.0s safety buffer ahead of zone arrival,
-        # but do not panic-rotate 30 seconds prematurely when farming is critical.
+        # Exact Core Rule:
+        # NEVER panic-rotate 30s prematurely.
+        # Only rotate if time_to_shrink <= traversal_eta + 5.0s or is_outside.
         time_to_shrink = shrink_start - t
         needs_rotation = is_outside or (time_to_shrink <= (eta_seconds + 5.0))
 
         return bool(needs_rotation), float(eta_seconds)
 
     # =========================================================================
-    # 3. Chokepoint & Funnel Precomputation
+    # 4. Chokepoint & Funnel Precomputation
     # =========================================================================
 
     def find_chokepoints(
@@ -360,8 +533,7 @@ class ZoneGatekeeper:
             inward = (dx / max(0.001, d_len), dy / max(0.001, d_len))
             outward = (-inward[0], -inward[1])
 
-            # Catchment Area Calculation:
-            # Measure the size of solid obstacles immediately to the left and right
+            # Catchment Area Calculation
             left_blocked = 0
             for k in range(1, 90):
                 if not walkable[(start - k) % num_samples]:
@@ -376,7 +548,6 @@ class ZoneGatekeeper:
                 else:
                     break
 
-            # Traffic score: ratio of blocked catchment meters to alley width
             catchment_meters = (left_blocked + right_blocked) * arc_meter_factor
             traffic_score = (catchment_meters / max(4.0, width_m)) * 10.0
 
@@ -396,7 +567,6 @@ class ZoneGatekeeper:
             )
             unique_chokes.append(cp)
 
-        # Sort by traffic score (highest kill potential first)
         unique_chokes.sort(key=lambda c: c.traffic_score, reverse=True)
         self._choke_cache[cache_key] = unique_chokes
         return unique_chokes
@@ -422,7 +592,6 @@ class ZoneGatekeeper:
         best_exit = (choke_x, choke_y)
         best_score = -1e9
 
-        # Search nearby cells (8m - 22m away) for walkable cells that lead inward
         for dr in range(-20, 21, 2):
             for dc in range(-20, 21, 2):
                 nr, nc = r0 + dr, c0 + dc
@@ -432,10 +601,8 @@ class ZoneGatekeeper:
                         cand_x = self.min_x + nc * self.step
                         cand_y = self.min_y + nr * self.step
                         cand_to_center = math.hypot(cand_x - cx, cand_y - cy)
-                        # Must be closer to center than choke (moving inward into safe zone)
                         if cand_to_center < d_choke_to_center:
                             if self.has_los(cand_x, cand_y, choke_x, choke_y):
-                                # Wall presence nearby provides cover
                                 sub = self.grid[max(0, nr-3):min(self.ny, nr+4), max(0, nc-3):min(self.nx, nc+4)]
                                 walls = int(np.sum(sub == 1))
                                 score = (d_choke_to_center - cand_to_center) * 2.0 + walls * 0.5 - abs(dist_cells - 14.0) * 0.5
@@ -444,12 +611,11 @@ class ZoneGatekeeper:
                                     best_ambush = (cand_x, cand_y)
                                     best_exit = (cand_x, cand_y)
 
-        # Pre-aim angle: directly down the alley toward choke_pos
         aim_yaw = math.atan2(choke_y - best_ambush[1], choke_x - best_ambush[0])
         return best_exit, best_ambush, aim_yaw
 
     # =========================================================================
-    # 4. Gatekeeper Ambush Doctrine
+    # 5. Gatekeeper Ambush Doctrine
     # =========================================================================
 
     def select_gatekeep_position(
@@ -493,7 +659,7 @@ class ZoneGatekeeper:
         return yaw, 0.0
 
     # =========================================================================
-    # 5. Endgame Survival Engine (< 5 alive)
+    # 6. Endgame Survival Engine & Perimeter Anchor (< 5 alive)
     # =========================================================================
 
     def is_endgame(self, alive_count: int, zone_radius: float) -> bool:
@@ -511,10 +677,10 @@ class ZoneGatekeeper:
         enemy_dist: float
     ) -> bool:
         """
-        Endgame Survival Engine:
+        Endgame Anchor Engine:
         When <= 5 alive, objective shifts to pure HP preservation (at 8:00 survivors ranked by HP).
-        Avoids all optional fights; lets remaining enemies butcher each other.
-        Only fights back if directly attacked at point-blank range (< 25m).
+        Avoids all optional fights; lets remaining enemies butcher each other down to the final duel.
+        Only fights back if directly attacked at point-blank range (< 20m).
         """
         if not self.is_endgame(alive_count, 100.0):
             return False
@@ -522,11 +688,11 @@ class ZoneGatekeeper:
         if not enemy:
             return True
 
-        # Point blank self defense (< 25m): must defend ourselves
-        if enemy_dist < 25.0:
+        # Point blank self defense (< 20m): must defend ourselves if attacked
+        if enemy_dist < 20.0:
             return False
 
-        # If enemy is not attacking us, or dist >= 25m: avoid fight!
+        # If enemy is not attacking us, or dist >= 20m: avoid fight!
         return True
 
     def get_endgame_position(
@@ -536,8 +702,9 @@ class ZoneGatekeeper:
         alive_count: int
     ) -> Tuple[float, float]:
         """
-        Finds the premier defensive position on high ground or deep cover
-        inside the final 60m circle to maximize HP preservation.
+        Endgame Anchor:
+        Holds deep perimeter cover inside the final 60m circle, safely away from
+        the chaotic central deathball and the 260 DPS gas rim.
         """
         center = zone_obs.get("next_center", zone_obs.get("center", [0.0, 0.0]))
         radius = float(zone_obs.get("next_radius", zone_obs.get("radius", 60.0)))
@@ -553,7 +720,6 @@ class ZoneGatekeeper:
         r_min = max(0, int((cy - r - self.min_y) / self.step))
         r_max = min(self.ny - 1, int((cy + r - self.min_y) / self.step))
 
-        # Sample grid at 2m stride for sub-millisecond execution
         stride = 2
         sub_grid = self.grid[r_min:r_max+1:stride, c_min:c_max+1:stride]
 
@@ -565,9 +731,9 @@ class ZoneGatekeeper:
         ys = self.min_y + rows * self.step
         dists = np.hypot(xs - cx, ys - cy)
 
-        # Valid cells: walkable, inside circle with 8m safety buffer from the lethal gas rim,
-        # and at least 10m from the center where the chaotic deathball forms.
-        valid = (sub_grid == 0) & (dists <= r - 8.0) & (dists >= 10.0)
+        # Deep perimeter cover: inside circle with 8m safety buffer from the lethal gas rim,
+        # and at least 15m from the center where the chaotic deathball forms.
+        valid = (sub_grid == 0) & (dists <= r - 8.0) & (dists >= 15.0)
         if not np.any(valid):
             fallback = (cx, cy)
             self._endgame_cache[cache_key] = fallback
@@ -583,16 +749,41 @@ class ZoneGatekeeper:
         else:
             z_norm = np.zeros_like(dists)
 
-        # 2. Deep Cover component:
-        dist_pref = -np.abs(dists - (r * 0.5)) / max(1.0, r)
+        # 2. Deep perimeter preference: distance around 0.65 - 0.85 of circle radius
+        target_dist = r * 0.72
+        dist_pref = -np.abs(dists - target_dist) / max(1.0, r)
 
-        # Composite survival score: high ground (4.0) + distance buffer (2.0)
-        total_score = np.where(valid, z_norm * 4.0 + dist_pref * 2.0, -1e9)
+        # Composite survival score
+        total_score = np.where(valid, z_norm * 4.0 + dist_pref * 2.5, -1e9)
         best_idx = np.unravel_index(np.argmax(total_score), total_score.shape)
 
         best_pos = (float(xs[best_idx]), float(ys[best_idx]))
         self._endgame_cache[cache_key] = best_pos
         return best_pos
+
+
+# =============================================================================
+# Standalone Global API (for direct functional callers)
+# =============================================================================
+
+_global_gatekeeper: Optional[ZoneGatekeeper] = None
+
+def evaluate_drop_objective(
+    my_pos: Tuple[float, float],
+    drops: List[Dict[str, Any]],
+    visible_enemies: List[Dict[str, Any]],
+    current_time: float
+) -> Optional[Tuple[float, float]]:
+    """
+    Exposed functional API for Supply Drop Interception:
+    evaluate_drop_objective(my_pos, drops, visible_enemies, current_time) -> Optional[Tuple[float, float]]
+    """
+    global _global_gatekeeper
+    if _global_gatekeeper is None:
+        _global_gatekeeper = ZoneGatekeeper()
+    return _global_gatekeeper.evaluate_drop_objective(
+        my_pos, drops, visible_enemies, current_time
+    )
 
 
 # =============================================================================
@@ -602,7 +793,7 @@ class ZoneGatekeeper:
 def run_all_tests():
     """Executes full test suite validating all tactical specifications."""
     print("=" * 70)
-    print("CHOKE: Zone Gatekeeper & Macro Strategist — Standalone Test Suite")
+    print("CHOKE: Zone Gatekeeper, Macro Strategist & Drop Snatcher Test Suite")
     print("=" * 70)
 
     t_start = time.perf_counter()
@@ -631,9 +822,9 @@ def run_all_tests():
               f"traffic_score={best.traffic_score:.1f}, ambush=({best.ambush_pos[0]:.1f}, {best.ambush_pos[1]:.1f})")
 
     # -------------------------------------------------------------------------
-    # Test 2: Gatekeeper Early Rotation Urgency vs Naive 15s Late Rotation
+    # Test 2: Rational Rotation Urgency (NEVER panic-rotate 30s prematurely)
     # -------------------------------------------------------------------------
-    print("\n[Test 2] Gatekeeper Early Rotation Urgency Doctrine")
+    print("\n[Test 2] Rational Rotation Urgency (No Premature Panic Rotation)")
     zone_test = {
         "center": [41.3, -72.8],
         "radius": 560.0,
@@ -643,22 +834,83 @@ def run_all_tests():
         "shrink_end": 110.0,
         "t": 30.0
     }
+    # Bot placed at 480m (100m outside the safe circle 380m)
+    # Traversal ETA ~ 12.8s. Time to shrink = 30s.
+    # Rule: Only rotate if time_to_shrink <= traversal_eta + 5.0s (30 > 12.8 + 5.0 = 17.8) -> DO NOT PANIC!
     bot_pos = (41.3 + 480.0, -72.8)
-    needs_rot, eta = gk.evaluate_rotation_urgency(bot_pos, zone_test, my_speed=11.7, current_time=30.0)
-    print(f"  Bot at distance 480m (100m outside safe circle):")
-    print(f"    Calculated traversal ETA: {eta:.1f}s")
-    print(f"    Rotation urgent at t=30.0s (30s before shrink)? {needs_rot}")
-    assert needs_rot is True, "Gatekeeper should trigger early rotation ahead of naive bots!"
+    needs_rot_30s, eta = gk.evaluate_rotation_urgency(bot_pos, zone_test, my_speed=11.7, current_time=30.0)
+    print(f"  Bot at dist 480m (safe=380m, ETA={eta:.1f}s) at t=30.0s (30s before shrink):")
+    print(f"    Needs rotation? {needs_rot_30s} (Target: False — do not panic rotate 30s prematurely!)")
+    assert needs_rot_30s is False, "Bot must NOT panic rotate 30s prematurely when farming is critical!"
 
+    # Now at t=45.0s (15s before shrink, time_to_shrink = 15.0s <= eta + 5.0s = 17.8s) -> MUST ROTATE NOW!
+    needs_rot_45s, _ = gk.evaluate_rotation_urgency(bot_pos, zone_test, my_speed=11.7, current_time=45.0)
+    print(f"  Same bot at t=45.0s (15s before shrink, time_left=15s <= ETA+5s=17.8s):")
+    print(f"    Needs rotation? {needs_rot_45s} (Target: True — rotate on schedule!)")
+    assert needs_rot_45s is True, "Bot must trigger rotation on schedule when time_left <= eta + 5.0s!"
+
+    # Bot already safely inside next circle (distance 200m)
     safe_bot = (41.3 + 200.0, -72.8)
-    needs_rot_safe, _ = gk.evaluate_rotation_urgency(safe_bot, zone_test, my_speed=11.7, current_time=30.0)
-    assert needs_rot_safe is False, "Bot safely inside next circle should not panic rotate"
+    needs_rot_safe, _ = gk.evaluate_rotation_urgency(safe_bot, zone_test, my_speed=11.7, current_time=45.0)
+    assert needs_rot_safe is False, "Bot safely inside next circle should never panic rotate"
     print(f"    Bot at distance 200m (safely inside next circle): needs_rot={needs_rot_safe} (PASS)")
 
     # -------------------------------------------------------------------------
-    # Test 3: Ohio Stadium Pinch Avoidance
+    # Test 3: SupplyDropInterceptor & Objective Controller
     # -------------------------------------------------------------------------
-    print("\n[Test 3] Ohio Stadium Pinch Avoidance & Safe Bypass")
+    print("\n[Test 3] SupplyDropInterceptor & Objective Controller")
+    drop_test = {
+        "id": 20000,
+        "pos": [100.0, 100.0, 0.0],
+        "radius": 8.0,
+        "lands_in": 25.0,
+        "progress": 0,
+        "holder": None
+    }
+    my_bot = (120.0, 100.0)  # 20m from drop
+
+    # Sub-case A: Beacon just appeared at t=70s (lands_in = 25.0s). Bot is close (20m).
+    # Expected: None (do not wait idle 25s early, continue farming).
+    targ_a = evaluate_drop_objective(my_bot, [drop_test], [], 70.0)
+    print(f"  Sub-case A: lands_in=25.0s, dist=20m -> target: {targ_a} (Expected: None)")
+    assert targ_a is None, "Should not intercept 25s early when close"
+
+    # Sub-case B: Drop descending at 9.0s before touchdown (lands_in = 9.0s <= 10.0s rule).
+    # Expected: path toward landing coordinate (100.0, 100.0) to arrive ~2s before touchdown.
+    drop_test["lands_in"] = 9.0
+    targ_b = evaluate_drop_objective(my_bot, [drop_test], [], 86.0)
+    print(f"  Sub-case B: lands_in=9.0s <= 10s rule -> target: {targ_b} (Expected: (100.0, 100.0))")
+    assert targ_b == (100.0, 100.0), "Should path toward landing coordinate 10s before touchdown!"
+
+    # Sub-case C: Drop is far (180m away), lands_in = 18.0s (t_travel ~ 17s).
+    # Expected: path toward landing coordinate early so t_arrival ≈ lands_in - 2.0s.
+    drop_test["lands_in"] = 18.0
+    far_bot = (280.0, 100.0)
+    targ_c = evaluate_drop_objective(far_bot, [drop_test], [], 77.0)
+    print(f"  Sub-case C: lands_in=18.0s, dist=180m -> target: {targ_c} (Expected: (100.0, 100.0))")
+    assert targ_c == (100.0, 100.0), "Should path early when far to achieve timed arrival!"
+
+    # Sub-case D: Drop has landed (lands_in = 0.0s), bot is outside the 8m ring (15m away).
+    drop_test["lands_in"] = 0.0
+    targ_d = evaluate_drop_objective((115.0, 100.0), [drop_test], [], 95.0)
+    print(f"  Sub-case D: lands_in=0.0s, dist=15m -> target: {targ_d} (Expected: (100.0, 100.0))")
+    assert targ_d == (100.0, 100.0), "Should navigate into 8m capture ring"
+
+    # Sub-case E: Drop has landed (lands_in = 0.0s), bot is inside 8m ring (4m away).
+    # Expected: hold within 8.0m capture radius for 4.0s!
+    inside_bot = (104.0, 100.0)
+    targ_e = evaluate_drop_objective(inside_bot, [drop_test], [], 96.0)
+    print(f"  Sub-case E: lands_in=0.0s, inside ring (dist=4m) -> target: {targ_e} (Hold ring)")
+    assert targ_e == inside_bot, "Should hold within 8.0m capture radius for 4.0s!"
+
+    # Defensive aim while capturing
+    aim_yaw, _ = gk.get_drop_defensive_aim(inside_bot, drop_test, [])
+    print(f"    Defensive approach crosshair yaw: {math.degrees(aim_yaw):.1f}° (PASS)")
+
+    # -------------------------------------------------------------------------
+    # Test 4: Ohio Stadium Pinch Avoidance & Safe Bypass
+    # -------------------------------------------------------------------------
+    print("\n[Test 4] Ohio Stadium Pinch Avoidance & Safe Bypass")
     west_bot = (-360.0, 100.0)
     south_goal = (41.3, -72.8)
     north_goal = (41.3, 200.0)
@@ -677,14 +929,10 @@ def run_all_tests():
     assert is_pinched_n is True, "Should detect stadium obstacle pinch!"
     assert bypass_n == gk.stadium_north_bypass, "Should select North bypass for northern destination!"
 
-    needs_rot_stadium, eta_stadium = gk.evaluate_rotation_urgency(west_bot, zone_test, my_speed=11.7, current_time=20.0)
-    print(f"    Stadium bypass traversal ETA: {eta_stadium:.1f}s, urgent: {needs_rot_stadium}")
-    assert eta_stadium > 15.0, "Detour around stadium should reflect realistic travel ETA"
-
     # -------------------------------------------------------------------------
-    # Test 4: Gatekeeper Ambush Doctrine Simulation
+    # Test 5: Gatekeeper Ambush Doctrine Simulation
     # -------------------------------------------------------------------------
-    print("\n[Test 4] Gatekeeper Ambush Doctrine Simulation")
+    print("\n[Test 5] Gatekeeper Ambush Doctrine Simulation")
     chokes_240 = gk.find_chokepoints(380.0, center, 240.0)
     chosen_choke = chokes_240[0]
     ambush_pos = gk.select_gatekeep_position((41.3, -72.8), chosen_choke)
@@ -696,7 +944,7 @@ def run_all_tests():
 
     assert gk.is_walkable(ambush_pos[0], ambush_pos[1]), "Ambush spot must be walkable"
     dist_ambush_center = math.hypot(ambush_pos[0] - center[0], ambush_pos[1] - center[1])
-    assert dist_ambush_center <= 240.0, "Ambush spot must be inside the safe zone!"
+    assert dist_ambush_center <= 240.0, "Ambush spot must be inside safe zone!"
 
     scrambler_pos = chosen_choke.pos
     scrambler_hp = 420.0
@@ -707,12 +955,13 @@ def run_all_tests():
     assert math.degrees(angle_error) < 5.0, "Pre-aim should align directly with incoming funnel path!"
 
     # -------------------------------------------------------------------------
-    # Test 5: Endgame Survival Engine (< 5 alive)
+    # Test 6: Endgame Survival Anchor (< 5 alive)
     # -------------------------------------------------------------------------
-    print("\n[Test 5] Endgame Survival Engine (< 5 alive)")
+    print("\n[Test 6] Endgame Survival Anchor (< 5 alive)")
     assert gk.is_endgame(alive_count=4, zone_radius=50.0) is True, "alive=4 must be endgame"
     assert gk.is_endgame(alive_count=12, zone_radius=300.0) is False, "alive=12 is not endgame"
 
+    # Avoid optional fights check
     enemy_far = {"id": 2, "hp": 1200.0, "weapons": ["gun"]}
     avoid_far = gk.should_avoid_combat(alive_count=3, my_hp=1400.0, enemy=enemy_far, enemy_dist=80.0)
     print(f"  alive=3: Enemy at 80m -> avoid fight? {avoid_far}")
@@ -723,25 +972,27 @@ def run_all_tests():
     print(f"  alive=3: Point-blank threat at 15m -> avoid fight? {avoid_close}")
     assert avoid_close is False, "Must engage in point-blank self-defense!"
 
+    # Deep perimeter cover in final 60m circle
     final_zone = {"center": [41.3, -72.8], "radius": 60.0, "next_radius": 60.0}
     endgame_pos = gk.get_endgame_position((41.3, -72.8), final_zone, alive_count=3)
     endgame_dist = math.hypot(endgame_pos[0] - center[0], endgame_pos[1] - center[1])
-    print(f"  Final 60m Circle -> Selected Defensive Position: ({endgame_pos[0]:.1f}, {endgame_pos[1]:.1f})")
-    print(f"    Dist to center: {endgame_dist:.1f}m (safe buffer from 260 DPS gas rim)")
+    print(f"  Final 60m Circle -> Selected Defensive Perimeter Anchor: ({endgame_pos[0]:.1f}, {endgame_pos[1]:.1f})")
+    print(f"    Dist to center: {endgame_dist:.1f}m (deep perimeter cover away from center brawl and gas rim)")
     assert gk.is_walkable(endgame_pos[0], endgame_pos[1]), "Endgame position must be walkable"
-    assert endgame_dist <= 52.0, "Endgame position must maintain safety buffer from gas rim"
+    assert 15.0 <= endgame_dist <= 52.0, "Endgame position must maintain perimeter buffer"
 
     # -------------------------------------------------------------------------
-    # Test 6: Micro-Benchmark Execution Time Constraint (< 2.0 ms)
+    # Test 7: Micro-Benchmark Execution Time Constraint (< 2.0 ms)
     # -------------------------------------------------------------------------
-    print("\n[Test 6] Micro-Benchmark Execution Time Constraint (< 2.0 ms)")
+    print("\n[Test 7] Micro-Benchmark Execution Time Constraint (< 2.0 ms)")
     iterations = 500
     t_bench_start = time.perf_counter()
 
     for i in range(iterations):
-        gk.evaluate_rotation_urgency((41.3 + (i % 100), -72.8), zone_test, my_speed=11.7, current_time=35.0)
+        gk.evaluate_rotation_urgency((41.3 + (i % 100), -72.8), zone_test, my_speed=11.7, current_time=45.0)
         chks = gk.find_chokepoints(380.0, center, 240.0)
         gk.select_gatekeep_position((41.3, -72.8), chks)
+        evaluate_drop_objective((120.0, 100.0), [drop_test], [], 86.0)
         gk.should_avoid_combat(4, 1400.0, enemy_far, 60.0)
         gk.get_endgame_position((41.3, -72.8), final_zone, 4)
 

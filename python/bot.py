@@ -18,6 +18,7 @@ from acoustics import AcousticRadar
 from artillery import ArtillerySystem
 from gatekeeper import ZoneGatekeeper, Chokepoint
 from rooftops import RooftopManager, RooftopEscapeTarget, is_on_rooftop
+from flank_orbit import FlankOrbitEngine
 
 class Bot:
     name = "opportunist-v1"
@@ -34,6 +35,7 @@ class Bot:
         self.artillery = ArtillerySystem(self.config)
         self.gatekeeper = ZoneGatekeeper(map_dir)
         self.rooftops = RooftopManager(map_dir)
+        self.flank_orbit = FlankOrbitEngine(map_dir)
 
         # Tactical memory
         self.seen_enemies: Dict[int, Dict[str, Any]] = {}
@@ -171,7 +173,9 @@ class Bot:
         time_since_combat = t - max(self.last_damaged_time, self.last_attack_time)
         in_combat_reset = time_since_combat >= 5.0  # 45 HP/s active healing!
 
-        closest_enemy = visible_enemies[0] if visible_enemies else None
+        # Use BALLIS Dynamic Target Scorer (selects lowest HP / rear-armor targets or early NPCs)
+        optimal_target = self.artillery.select_optimal_target([x, y, z], obs.get("mechs", []), t)
+        closest_enemy = optimal_target if optimal_target else (visible_enemies[0] if visible_enemies else None)
         enemy_dist = math.hypot(closest_enemy["pos"][0] - x, closest_enemy["pos"][1] - y) if closest_enemy else 1e9
 
         # 4. High-Level Decision Engine (Disciplined Opportunist & Zone Gatekeeper)
@@ -282,23 +286,12 @@ class Bot:
                 nav_target = (x + kmove[0] * 25.0, y + kmove[1] * 25.0)
             should_boost = enemy_dist < 35.0
 
-        # --- Priority 3: Supply Drop Snatch / Ambush ---
-        elif obs.get("drops") and t > 65.0:
-            drop = obs["drops"][0]
-            d_pos = drop["pos"]
-            d_dist = math.hypot(d_pos[0] - x, d_pos[1] - y)
-            d_lands_in = drop.get("lands_in", 0.0)
-            d_holder = drop.get("holder")
-
-            if d_dist < 250.0:
-                if d_holder is None and (not visible_enemies or enemy_dist > 50.0):
-                    self.active_state = "DROP_CAPTURE"
-                    nav_target = (d_pos[0], d_pos[1])
-                    should_boost = d_dist > 20.0 and d_lands_in <= 5.0
-                else:
-                    self.active_state = "DROP_AMBUSH"
-                    ambush_pos = (d_pos[0] - 50.0, d_pos[1] - 20.0)
-                    nav_target = ambush_pos
+        # --- Priority 3: Supply Drop Snatcher (CHOKE Drop Interceptor) ---
+        drop_target = self.gatekeeper.evaluate_drop_objective((x, y), obs.get("drops", []), visible_enemies, t)
+        if drop_target is not None:
+            self.active_state = "DROP_CAPTURE"
+            nav_target = drop_target
+            should_boost = math.hypot(drop_target[0] - x, drop_target[1] - y) > 15.0
 
         # --- Priority 4: Tactical Combat (Engage with Transverse Strafing) ---
         elif closest_enemy:
@@ -307,42 +300,47 @@ class Bot:
             nav_target = (x + combat_move[0] * 25.0, y + combat_move[1] * 25.0)
             should_boost = enemy_dist < 35.0
 
-        # --- Priority 5: Safe Farm (Harvest Loose Cubes, Floor Weapons, Crates) ---
+        # --- Priority 5: Safe Farm & Perimeter Flank Orbit (ATLAS Flank Orbit Engine) ---
         else:
             self.active_state = "SAFE_FARM"
             death_pos = self.radar.find_recent_death_event()
-            if death_pos and math.hypot(death_pos[0] - x, death_pos[1] - y) < 120.0:
+            cubes = obs.get("cubes", [])
+            pickups = [p for p in obs.get("pickups", []) if p.get("kind") in ("laser", "lightning", "mortar")]
+            crates = obs.get("crates", [])
+
+            # 1. Floor weapons FIRST (Laser / Lightning / Mortar) if slot 1 is empty!
+            if me["weapons"][1] is None and pickups:
+                pickups.sort(key=lambda p: math.hypot(p["pos"][0] - x, p["pos"][1] - y))
+                nav_target = (pickups[0]["pos"][0], pickups[0]["pos"][1])
+                should_boost = math.hypot(pickups[0]["pos"][0] - x, pickups[0]["pos"][1] - y) > 15.0
+            # 2. Loose power cubes within 50m
+            elif cubes and math.hypot(cubes[0]["pos"][0] - x, cubes[0]["pos"][1] - y) < 50.0:
+                cubes.sort(key=lambda c: math.hypot(c["pos"][0] - x, c["pos"][1] - y))
+                nav_target = (cubes[0]["pos"][0], cubes[0]["pos"][1])
+                should_boost = math.hypot(cubes[0]["pos"][0] - x, cubes[0]["pos"][1] - y) > 20.0
+            # 3. Third-party recent kill
+            elif death_pos and math.hypot(death_pos[0] - x, death_pos[1] - y) < 80.0:
                 self.active_state = "THIRD_PARTY_AMBUSH"
                 nav_target = (death_pos[0], death_pos[1])
+            # 4. Nearby crates within 35m
+            elif crates and math.hypot(crates[0]["pos"][0] - x, crates[0]["pos"][1] - y) < 35.0:
+                crates.sort(key=lambda c: math.hypot(c["pos"][0] - x, c["pos"][1] - y))
+                target_crate = crates[0]
+                nav_target = (target_crate["pos"][0], target_crate["pos"][1])
+                crate_dist = math.hypot(target_crate["pos"][0] - x, target_crate["pos"][1] - y)
+                if crate_dist < 40.0 and self.nav.has_los(x, y, target_crate["pos"][0], target_crate["pos"][1]):
+                    cdx = target_crate["pos"][0] - x
+                    cdy = target_crate["pos"][1] - y
+                    cdz = (target_crate.get("pos", [0, 0, 0])[2] + 1.2) - (z + 7.0)
+                    torso_aim = (math.atan2(cdy, cdx), math.atan2(cdz, max(crate_dist, 0.01)))
+                    w0 = me["weapons"][0]
+                    if w0 and w0.get("ammo", 0) > 0 and w0.get("reload", 0) == 0:
+                        should_fire[0] = True
+            # 5. Otherwise, FLANK ORBIT along the 0.75*R perimeter in deep cover!
             else:
-                cubes = obs.get("cubes", [])
-                pickups = [p for p in obs.get("pickups", []) if p.get("kind") in ("laser", "lightning", "mortar")]
-                crates = obs.get("crates", [])
-
-                # 1. Floor weapons FIRST (Laser / Lightning / Mortar) if slot 1 is empty!
-                if me["weapons"][1] is None and pickups:
-                    pickups.sort(key=lambda p: math.hypot(p["pos"][0] - x, p["pos"][1] - y))
-                    nav_target = (pickups[0]["pos"][0], pickups[0]["pos"][1])
-                    should_boost = math.hypot(pickups[0]["pos"][0] - x, pickups[0]["pos"][1] - y) > 15.0
-                # 2. Loose power cubes (free +4% HP & dmg, 0 ammo needed)
-                elif cubes:
-                    cubes.sort(key=lambda c: math.hypot(c["pos"][0] - x, c["pos"][1] - y))
-                    nav_target = (cubes[0]["pos"][0], cubes[0]["pos"][1])
-                    should_boost = math.hypot(cubes[0]["pos"][0] - x, cubes[0]["pos"][1] - y) > 20.0
-                # 3. Unopened crates
-                elif crates:
-                    crates.sort(key=lambda c: math.hypot(c["pos"][0] - x, c["pos"][1] - y))
-                    target_crate = crates[0]
-                    nav_target = (target_crate["pos"][0], target_crate["pos"][1])
-                    crate_dist = math.hypot(target_crate["pos"][0] - x, target_crate["pos"][1] - y)
-                    if crate_dist < 40.0 and self.nav.has_los(x, y, target_crate["pos"][0], target_crate["pos"][1]):
-                        cdx = target_crate["pos"][0] - x
-                        cdy = target_crate["pos"][1] - y
-                        cdz = (target_crate.get("pos", [0, 0, 0])[2] + 1.2) - (z + 7.0)
-                        torso_aim = (math.atan2(cdy, cdx), math.atan2(cdz, max(crate_dist, 0.01)))
-                        w0 = me["weapons"][0]
-                        if w0 and w0.get("ammo", 0) > 0 and w0.get("reload", 0) == 0:
-                            should_fire[0] = True
+                self.active_state = "FLANK_ORBIT"
+                flank_wp = self.flank_orbit.get_flank_waypoint((x, y), zone, obs.get("sounds", []), alive_count)
+                nav_target = flank_wp
 
         # 5. Weapon Aiming & Firing Execution
         has_enemy_los = False
