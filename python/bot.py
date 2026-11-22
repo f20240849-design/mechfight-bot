@@ -301,26 +301,33 @@ class Bot:
         # Triggered if:
         # a) Low HP (< 550)
         # b) Enemy is charging Laser with direct LOS and we don't have Laser
-        # c) Enemy holds Laser at range (> 50m) while we only have Gun
-        # d) Ghost Phase (t < 30s) encounter at > 60m without Laser: NEVER duel in the open!
-        # e) TTK inequality test indicates negative expected value
-        elif (closest_enemy and (
-            my_hp < 550.0
-            or (enemy_is_charging and has_enemy_los and not holds_laser)
-            or (enemy_holds_laser and enemy_dist > 50.0 and not holds_laser and has_enemy_los)
+        # c) Enemy holds Laser at range (> 45m) while we only have Gun and they have direct LOS
+        # d) Ghost Phase (t < 30s) encounter with direct LOS at > 50m without Laser: NEVER duel in open!
+        # e) Taking active damage without superior weapon
+        elif (closest_enemy and has_enemy_los and (
+            my_hp < 600.0
+            or (enemy_is_charging and not holds_laser)
+            or (enemy_holds_laser and enemy_dist > 40.0 and not holds_laser)
             or (t < 30.0 and enemy_dist > 50.0 and not holds_laser)
-        )) or (t - self.last_damaged_time < 1.5 and my_hp < 650.0):
-            self.active_state = "COMBAT_RESET"
+        )) or (t - self.last_damaged_time < 2.0 and my_hp < 750.0):
             threat_pos = (closest_enemy["pos"][0], closest_enemy["pos"][1]) if closest_enemy else (
                 (x - math.cos(self.last_damaged_bearing or 0.0) * 50.0, y - math.sin(self.last_damaged_bearing or 0.0) * 50.0)
             )
             cover = self.nav.find_cover_spot((x, y), threat_pos)
-            if cover:
+            if cover and math.hypot(x - cover[0], y - cover[1]) < 3.0 and not has_enemy_los:
+                # Safely occluded behind building wall: hold position and heal!
+                self.active_state = "COVER_HEALING"
+                nav_target = (x, y)
+                should_boost = False
+            elif cover:
+                self.active_state = "COMBAT_RESET"
                 nav_target = cover
+                should_boost = True
             else:
+                self.active_state = "COMBAT_RESET"
                 kmove = self.combat.compute_kiting_move([x, y], list(threat_pos), None, tick, nav=self.nav)
                 nav_target = (x + kmove[0] * 25.0, y + kmove[1] * 25.0)
-            should_boost = True
+                should_boost = True
 
         # Priority 2: Ghost Phase & Weapon Rush (Opening 0-30s or Empty Slot 1)
         # In early game, securing a Laser/Lightning weapon is the single highest expected value move
@@ -514,7 +521,13 @@ class Bot:
             self.current_waypoints = self.nav.plan_path((x, y), nav_target)
             self.cached_nav_target = nav_target
 
-        if self.current_waypoints:
+        dist_to_target = math.hypot(nav_target[0] - x, nav_target[1] - y)
+        if dist_to_target < 2.5 and self.active_state in ("COVER_HEALING", "ROOFTOP_PERCH"):
+            # Hold stationary in cover: 0 m/s speed, silent, 0 energy drain, 45 HP/s regen!
+            move_vec = [0.0, 0.0]
+            move_yaw = me.get("aim", [0.0, 0.0])[0]
+            should_boost = False
+        elif self.current_waypoints:
             wp = self.current_waypoints[0]
             move_yaw = math.atan2(wp[1] - y, wp[0] - x)
             move_vec = [math.cos(move_yaw), math.sin(move_yaw)]
@@ -531,7 +544,10 @@ class Bot:
         if is_threatened and evasion_res["dodge_vec"]:
             d_vec = evasion_res["dodge_vec"]
             if self.nav.is_walkable(x + d_vec[0] * 3.0, y + d_vec[1] * 3.0):
-                move_vec = [d_vec[0] * 0.85 + move_vec[0] * 0.15, d_vec[1] * 0.85 + move_vec[1] * 0.15]
+                # When escaping to cover, blend 35% transverse dodge with 65% cover navigation
+                dodge_weight = 0.35 if self.active_state in ("COMBAT_RESET", "ZONE_ROTATION") else 0.85
+                move_weight = 1.0 - dodge_weight
+                move_vec = [d_vec[0] * dodge_weight + move_vec[0] * move_weight, d_vec[1] * dodge_weight + move_vec[1] * move_weight]
                 mlen = math.hypot(move_vec[0], move_vec[1])
                 if mlen > 0.01:
                     move_vec = [move_vec[0] / mlen, move_vec[1] / mlen]
@@ -549,13 +565,14 @@ class Bot:
         # =========================================================================
         # 8. Decoupled Facing & Vision Sweep Policy (Sections 2 & 6)
         # =========================================================================
-        # If in retreat or kiting, execute the Claude +/-70 deg defensive facing rule:
+        # If in retreat, cover healing or rooftop escape, execute Claude +/-70 deg defensive facing rule:
         # Protects front-arc 180 deg armor while keeping travel path in 120 deg vision wedge!
-        if self.active_state in ("COMBAT_RESET", "ROOFTOP_EXIT", "ROOFTOP_ESCAPE") and closest_enemy:
+        if self.active_state in ("COMBAT_RESET", "COVER_HEALING", "ROOFTOP_EXIT", "ROOFTOP_ESCAPE") and closest_enemy:
             threat_yaw = math.atan2(closest_enemy["pos"][1] - y, closest_enemy["pos"][0] - x)
             defensive_aim_yaw = self.compute_defensive_facing(threat_yaw, move_yaw)
             torso_aim = (defensive_aim_yaw, 0.0)
-            if not has_enemy_los and not (me["weapons"][1] and me["weapons"][1].get("kind") == "mortar"):
+            # Never fire arm gun while retreating or healing in cover!
+            if not (me["weapons"][1] and me["weapons"][1].get("kind") == "mortar"):
                 should_fire = [False, False]
 
         elif (not closest_enemy or not has_enemy_los) and t - self.last_damaged_time < 1.5:

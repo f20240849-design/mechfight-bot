@@ -45,6 +45,12 @@ def sync_modules():
         "modules/verticality/flank_orbit.py": ["flank_orbit.py", "python/flank_orbit.py"],
         "modules/artillery/artillery.py": ["artillery.py", "python/artillery.py"],
         "modules/gatekeeper/gatekeeper.py": ["gatekeeper.py", "python/gatekeeper.py"],
+        "bot.py": ["python/bot.py"],
+        "nav.py": ["python/nav.py"],
+        "evasion.py": ["python/evasion.py"],
+        "combat.py": ["python/combat.py"],
+        "ballistics.py": ["python/ballistics.py"],
+        "acoustics.py": ["python/acoustics.py"],
     }
     
     for src_rel, dst_list in mapping.items():
