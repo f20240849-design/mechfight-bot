@@ -522,6 +522,11 @@ class Bot:
             move_yaw = math.atan2(nav_target[1] - y, nav_target[0] - x)
             move_vec = [math.cos(move_yaw), math.sin(move_yaw)]
 
+        # Apply ATLAS Wall-Slide Vector to glide smoothly around building corners & concave pockets
+        if hasattr(self.nav, "compute_wall_slide_vector"):
+            slide_vx, slide_vy = self.nav.compute_wall_slide_vector(x, y, move_vec[0], move_vec[1])
+            move_vec = [slide_vx, slide_vy]
+
         # 7. Dynamic Evasion Vector Integration
         if is_threatened and evasion_res["dodge_vec"]:
             d_vec = evasion_res["dodge_vec"]

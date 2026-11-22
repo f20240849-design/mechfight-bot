@@ -203,7 +203,110 @@ class NavMesh:
             smooth_path.append(raw_waypoints[furthest])
             i = furthest
 
-        return smooth_path
+        return self.round_corner_waypoints(smooth_path)
+
+    def round_corner_waypoints(
+        self,
+        waypoints: List[Tuple[float, float]],
+        fillet_radius: float = 4.5,
+        min_angle_deg: float = 35.0
+    ) -> List[Tuple[float, float]]:
+        """
+        Rounds sharp corners (e.g. 90-degree building turns) into smooth wall-sliding arcs.
+        Replaces sharp vertices with tangential fillet waypoints that maintain safe wall clearance.
+        """
+        if len(waypoints) < 3:
+            return waypoints
+
+        result: List[Tuple[float, float]] = [waypoints[0]]
+        for i in range(1, len(waypoints) - 1):
+            p_prev = waypoints[i - 1]
+            p_curr = waypoints[i]
+            p_next = waypoints[i + 1]
+
+            v1 = (p_curr[0] - p_prev[0], p_curr[1] - p_prev[1])
+            v2 = (p_next[0] - p_curr[0], p_next[1] - p_curr[1])
+            l1 = math.hypot(v1[0], v1[1])
+            l2 = math.hypot(v2[0], v2[1])
+
+            if l1 < 2.0 or l2 < 2.0:
+                result.append(p_curr)
+                continue
+
+            u1 = (v1[0] / l1, v1[1] / l1)
+            u2 = (v2[0] / l2, v2[1] / l2)
+            dot = max(-1.0, min(1.0, u1[0] * u2[0] + u1[1] * u2[1]))
+            turn_angle_deg = math.acos(dot) * 180.0 / math.pi
+
+            if turn_angle_deg >= min_angle_deg:
+                d_cut = min(fillet_radius * math.tan(turn_angle_deg * math.pi / 360.0), 0.45 * l1, 0.45 * l2)
+                p_in = (p_curr[0] - d_cut * u1[0], p_curr[1] - d_cut * u1[1])
+                p_out = (p_curr[0] + d_cut * u2[0], p_curr[1] + d_cut * u2[1])
+
+                bisect = (u2[0] - u1[0], u2[1] - u1[1])
+                blen = math.hypot(bisect[0], bisect[1])
+                if blen > 1e-4:
+                    ub = (bisect[0] / blen, bisect[1] / blen)
+                    apex = (p_curr[0] + (d_cut * 0.35) * ub[0], p_curr[1] + (d_cut * 0.35) * ub[1])
+                    if self.is_walkable(apex[0], apex[1]):
+                        result.extend([p_in, apex, p_out])
+                    elif self.is_walkable(p_in[0], p_in[1]) and self.is_walkable(p_out[0], p_out[1]):
+                        result.extend([p_in, p_out])
+                    else:
+                        result.append(p_curr)
+                else:
+                    result.extend([p_in, p_out])
+            else:
+                result.append(p_curr)
+
+        result.append(waypoints[-1])
+        return result
+
+    def compute_wall_slide_vector(
+        self,
+        px: float,
+        py: float,
+        desired_vx: float,
+        desired_vy: float,
+        probe_dist: float = 3.5
+    ) -> Tuple[float, float]:
+        """
+        Wall-sliding along concave and convex wall contours:
+        When moving near walls, projects velocity along the tangent of the wall normal.
+        In concave corners (inside pockets), deflects velocity outward along the concave bisector.
+        """
+        normals = []
+        for deg in range(0, 360, 30):
+            rad = math.radians(deg)
+            dx, dy = math.cos(rad), math.sin(rad)
+            for d in (1.5, 2.5, probe_dist):
+                qx, qy = px + dx * d, py + dy * d
+                col, row = self.world_to_grid(qx, qy)
+                if self.grid[row, col] == 1:
+                    normals.append((-dx, -dy))
+                    break
+        if not normals:
+            return desired_vx, desired_vy
+
+        avg_nx = sum(n[0] for n in normals)
+        avg_ny = sum(n[1] for n in normals)
+        nlen = math.hypot(avg_nx, avg_ny)
+        if nlen < 1e-4:
+            return desired_vx, desired_vy
+        nx_out = avg_nx / nlen
+        ny_out = avg_ny / nlen
+
+        dot = desired_vx * nx_out + desired_vy * ny_out
+        if dot < 0.0:
+            slide_x = desired_vx - dot * nx_out
+            slide_y = desired_vy - dot * ny_out
+            if len(normals) >= 3:
+                slide_x += nx_out * 0.35
+                slide_y += ny_out * 0.35
+            slen = math.hypot(slide_x, slide_y)
+            if slen > 1e-4:
+                return slide_x / slen, slide_y / slen
+        return desired_vx, desired_vy
 
     def find_cover_spot(self, my_pos: Tuple[float, float], threat_pos: Tuple[float, float], min_dist: float = 30.0, max_dist: float = 60.0) -> Optional[Tuple[float, float]]:
         """Find a nearby cell that breaks line-of-sight from threat_pos."""
