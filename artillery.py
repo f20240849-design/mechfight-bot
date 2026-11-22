@@ -64,13 +64,28 @@ LASER_COOLDOWN = 1.65                   # seconds
 LASER_RANGE = 280.0                     # meters
 LASER_COOKOFF_MULT = 1.6                # +60% vs mortar carrier (504 dmg, or 756 rear!)
 
-# Lightning Physical Numbers
+# Mortar Physical Numbers & Ground-Bouncing Calibrations
+MORTAR_SPEED = 70.0                     # m/s
+MORTAR_GRAVITY = 18.0                   # m/s^2
+MORTAR_DIRECT_DAMAGE = 200.0            # Direct shell impact
+MORTAR_SPLASH_DAMAGE = 160.0            # Max splash damage at blast center
+MORTAR_SPLASH_RADIUS = 7.0              # meters (effective splash damage zone)
+MORTAR_BLAST_RADIUS = 14.0              # meters (full concussion/knockback radius)
+MORTAR_CONCUSSION_KNOCK = 16.0          # m/s
+MORTAR_CONCUSSION_DRAIN = 45.0          # energy drain
+MORTAR_GROUND_BOUNCE_OFFSET_DEFAULT = 3.5 # meters behind target (strictly <= 7.0m splash zone)
+
+# Lightning Physical Numbers & Chain Farming Calibrations
 LIGHTNING_DAMAGE = 60.0
 LIGHTNING_RANGE = 45.0                  # meters
 LIGHTNING_CONE_DEG = 30.0               # +-15 degrees
 LIGHTNING_COOLDOWN = 0.25               # seconds (240 DPS sustained)
 LIGHTNING_ENERGY = 3.0                  # energy cost per discharge (0 ammo)
 LIGHTNING_SHORT_S = 2.0                 # locks enemy Lasers offline for 2.0s!
+LIGHTNING_CHAIN_COUNT = 2               # chains to up to 2 secondary targets
+LIGHTNING_CHAIN_RANGE = 14.0            # meters (secondary chain jump radius)
+LIGHTNING_CHAIN_MULT = 0.7              # 0.7x damage per chain jump
+LIGHTNING_CHAIN_DAMAGE = 60.0 * 0.7     # 42.0 damage per secondary target
 
 # NPC Specifications
 NPC_COUNT = 12
@@ -364,6 +379,65 @@ class IndirectParabolicMortarSolver:
             target_pos=(target_pos[0], target_pos[1], target_pos[2]),
             predicted_impact=(tx, ty, tz)
         )
+
+    def solve_ground_bounce_splash(
+        self,
+        my_pos: Union[List[float], Tuple[float, float, float]],
+        target_pos: Union[List[float], Tuple[float, float, float]],
+        target_vel: Optional[Union[List[float], Tuple[float, float, float]]] = None,
+        behind_offset: float = MORTAR_GROUND_BOUNCE_OFFSET_DEFAULT,
+        terrain_z: Optional[float] = None
+    ) -> Optional[MortarTrajectory]:
+        """
+        Mortar Splash Ground-Bouncing Solver:
+        When a target ducks behind a low wall, direct trajectory clips the wall.
+        Solves the high-arc parabolic mortar trajectory to hit the terrain immediately
+        behind the target within the 7m splash zone (behind_offset <= 7.0m).
+        
+        The shell plunges steeply over the low wall and impacts the ground behind the target,
+        delivering up to 160 splash damage and 16 m/s concussion knockback + 45 energy drain.
+        """
+        # Ensure offset is strictly within the 7m splash zone
+        effective_offset = min(max(0.5, behind_offset), MORTAR_SPLASH_RADIUS)
+
+        lx, ly, lz = my_pos[0], my_pos[1], my_pos[2] + self.tube_height_offset
+        tx, ty, tz = target_pos[0], target_pos[1], target_pos[2]
+
+        dx = tx - lx
+        dy = ty - ly
+        horiz_dist = math.hypot(dx, dy)
+        if horiz_dist < 1e-4:
+            return None
+
+        # Unit vector along line of fire from launcher to target
+        ux = dx / horiz_dist
+        uy = dy / horiz_dist
+
+        # Ground impact position placed immediately behind target along firing line
+        ground_z = terrain_z if terrain_z is not None else tz
+        impact_x = tx + ux * effective_offset
+        impact_y = ty + uy * effective_offset
+        impact_z = ground_z
+
+        # Verify distance from target to ground impact is within 7m splash zone
+        dist_to_target = math.hypot(impact_x - tx, impact_y - ty)
+        if dist_to_target > MORTAR_SPLASH_RADIUS + 1e-3:
+            effective_offset = MORTAR_SPLASH_RADIUS
+            impact_x = tx + ux * effective_offset
+            impact_y = ty + uy * effective_offset
+
+        # Solve high-arc parabolic trajectory to the terrain impact position
+        return self.solve_high_arc(my_pos, [impact_x, impact_y, impact_z], target_vel)
+
+    def calculate_splash_damage(self, dist_from_impact: float) -> float:
+        """
+        Calculates splash damage based on distance from impact point within 7m splash zone.
+        Protocol: splash 160 falling to 30% (48 dmg) at splash_radius 7m.
+        """
+        if dist_from_impact > MORTAR_SPLASH_RADIUS:
+            return 0.0
+        frac = dist_from_impact / MORTAR_SPLASH_RADIUS
+        return MORTAR_SPLASH_DAMAGE * (1.0 - 0.7 * frac)
 
     def solve_trajectory(
         self,
@@ -682,6 +756,25 @@ class LightningConeTrigger:
         self.damage_per_shot = damage_per_shot
         self.cooldown = cooldown
         self.energy_cost = energy_cost
+        self.chain_farming = LightningChainFarming(
+            chain_range=LIGHTNING_CHAIN_RANGE,
+            max_chain_targets=LIGHTNING_CHAIN_COUNT,
+            damage_mult=LIGHTNING_CHAIN_MULT,
+            base_damage=damage_per_shot,
+            cone_deg=cone_deg,
+            max_primary_range=trigger_range
+        )
+
+    def evaluate_chain(
+        self,
+        my_pos: Union[List[float], Tuple[float, ...]],
+        aim_yaw: float,
+        enemies: List[Dict[str, Any]],
+        crates: Optional[List[Dict[str, Any]]] = None,
+        npcs: Optional[List[Dict[str, Any]]] = None
+    ) -> Optional["LightningChainResult"]:
+        """Evaluates Lightning Chain Farming against enemies, crates, and NPCs."""
+        return self.chain_farming.evaluate_chain_farming(my_pos, aim_yaw, enemies, crates, npcs)
 
     def is_in_cone(
         self,
@@ -755,6 +848,215 @@ class LightningConeTrigger:
             return None
         valid.sort(key=lambda item: item[0], reverse=True)
         return valid[0][1]
+
+
+@dataclass
+class LightningChainResult:
+    primary_target: Dict[str, Any]
+    primary_pos: Tuple[float, float, float]
+    primary_damage: float
+    secondary_targets: List[Dict[str, Any]]
+    secondary_damages: List[float]
+    total_damage: float
+    jumps_to_shielded: bool
+    aim_yaw: float
+    aim_pitch: float
+    is_crate_primary: bool
+    score: float
+
+
+class LightningChainFarming:
+    """
+    Lightning Chain Farming & Arc Jumping Engine.
+    
+    Doctrines:
+    - Lightning chains to up to 2 secondary targets within 14m (0.7x damage = 42.0 dmg each).
+    - In group fights: target the closest enemy or crate in cone to jump arcs into shielded targets.
+    - Bypasses directional shields, barriers, or cover by jumping arcs through accessible close proxies (crates/enemies).
+    - Yields up to 60 (primary) + 42 + 42 = 144 damage per 0.25s discharge (576 DPS total group damage!).
+    """
+
+    def __init__(
+        self,
+        chain_range: float = LIGHTNING_CHAIN_RANGE,
+        max_chain_targets: int = LIGHTNING_CHAIN_COUNT,
+        damage_mult: float = LIGHTNING_CHAIN_MULT,
+        base_damage: float = LIGHTNING_DAMAGE,
+        cone_deg: float = LIGHTNING_CONE_DEG,
+        max_primary_range: float = 40.0
+    ):
+        self.chain_range = chain_range
+        self.max_chain_targets = max_chain_targets
+        self.damage_mult = damage_mult
+        self.base_damage = base_damage
+        self.chain_damage = base_damage * damage_mult
+        self.half_cone_rad = math.radians(cone_deg / 2.0)
+        self.max_primary_range = max_primary_range
+
+    def is_shielded(self, target: Dict[str, Any]) -> bool:
+        """Determines if a target is shielded or has active defense."""
+        if target.get("shield") or target.get("is_shielded") or target.get("shielded"):
+            return True
+        if target.get("shield_active") or target.get("shield_hp", 0.0) > 0.0:
+            return True
+        return False
+
+    def is_in_cone(
+        self,
+        my_pos: Union[List[float], Tuple[float, ...]],
+        aim_yaw: float,
+        target_pos: Union[List[float], Tuple[float, ...]]
+    ) -> Tuple[bool, float, float]:
+        dx = target_pos[0] - my_pos[0]
+        dy = target_pos[1] - my_pos[1]
+        dist = math.hypot(dx, dy)
+        if dist > self.max_primary_range:
+            return False, dist, 0.0
+
+        target_bearing = math.atan2(dy, dx)
+        diff = math.atan2(math.sin(target_bearing - aim_yaw), math.cos(target_bearing - aim_yaw))
+        in_cone = abs(diff) <= self.half_cone_rad
+        return in_cone, dist, abs(diff)
+
+    def find_secondaries(
+        self,
+        primary_pos: Union[List[float], Tuple[float, ...]],
+        primary_id: Any,
+        all_candidates: List[Dict[str, Any]]
+    ) -> Tuple[List[Dict[str, Any]], List[float], bool]:
+        """
+        Finds up to 2 secondary targets within 14m of the primary target.
+        Prioritizes shielded targets (to bypass shield via chain jumps), laser carriers,
+        low HP enemies, NPCs, and crates.
+        """
+        px, py = primary_pos[0], primary_pos[1]
+        secondaries = []
+        has_shielded = False
+
+        for cand in all_candidates:
+            cid = cand.get("id")
+            if cid is not None and cid == primary_id:
+                continue
+
+            cpos = cand.get("pos", [0, 0, 0])
+            dist = math.hypot(cpos[0] - px, cpos[1] - py)
+            if dist <= self.chain_range:
+                shielded = self.is_shielded(cand)
+                if shielded:
+                    has_shielded = True
+
+                kind = cand.get("kind", "mech")
+                hp = float(cand.get("hp", 500.0))
+                weapons = cand.get("weapons", [])
+                holds_laser = "laser" in weapons
+
+                # Score priority for secondary arcs:
+                # Shielded targets get top ranking to bypass shield via arc jump (+2000)
+                score = (2000.0 if shielded else 0.0) + \
+                        (1000.0 if holds_laser else 0.0) + \
+                        (500.0 if kind == "mech" else (300.0 if kind == "npc" else 100.0)) + \
+                        (1000.0 / max(1.0, hp)) - (dist * 2.0)
+
+                secondaries.append((score, cand))
+
+        secondaries.sort(key=lambda s: s[0], reverse=True)
+        chosen = [s[1] for s in secondaries[:self.max_chain_targets]]
+        damages = [self.chain_damage] * len(chosen)
+        return chosen, damages, has_shielded
+
+    def evaluate_chain_farming(
+        self,
+        my_pos: Union[List[float], Tuple[float, ...]],
+        aim_yaw: float,
+        enemies: List[Dict[str, Any]],
+        crates: Optional[List[Dict[str, Any]]] = None,
+        npcs: Optional[List[Dict[str, Any]]] = None
+    ) -> Optional[LightningChainResult]:
+        """
+        Evaluates group fight targets to maximize Lightning Chain Farming:
+        - Primary targets can be enemies, NPCs, or crates in 30° cone.
+        - Chains to up to 2 secondary targets within 14m (0.7x damage).
+        - In group fights: targets the closest enemy or crate to jump arcs into shielded targets.
+        """
+        all_pool = list(enemies)
+        if npcs:
+            all_pool.extend(npcs)
+        if crates:
+            all_pool.extend(crates)
+
+        # Check if there are shielded enemies in the area
+        shielded_enemies = [e for e in enemies if self.is_shielded(e)]
+
+        results: List[LightningChainResult] = []
+
+        for cand in all_pool:
+            cpos = cand.get("pos", [0, 0, 0])
+            in_cone, dist, _ = self.is_in_cone(my_pos, aim_yaw, cpos)
+            if not in_cone:
+                continue
+
+            cid = cand.get("id")
+            kind = cand.get("kind", "crate" if cid and cid >= 1000 else "mech")
+            is_crate = (kind == "crate") or (cid is not None and cid >= 1000)
+
+            # Find up to 2 secondary targets within 14m
+            secondaries, sec_damages, jumps_to_shield = self.find_secondaries(cpos, cid, all_pool)
+
+            # Check if this primary jumps to any known shielded enemy
+            if shielded_enemies and not jumps_to_shield:
+                for se in shielded_enemies:
+                    if se.get("id") != cid:
+                        se_pos = se.get("pos", [0, 0, 0])
+                        if math.hypot(se_pos[0] - cpos[0], se_pos[1] - cpos[1]) <= self.chain_range:
+                            jumps_to_shield = True
+                            if se not in secondaries and len(secondaries) < self.max_chain_targets:
+                                secondaries.append(se)
+                                sec_damages.append(self.chain_damage)
+                            break
+
+            total_dmg = self.base_damage + sum(sec_damages)
+
+            # In group fights: prioritize closest enemy or crate to jump arcs into shielded targets
+            score = total_dmg
+            if jumps_to_shield:
+                # Massive priority for jumping arcs into shielded targets!
+                score += 3000.0
+                # Heavily prioritize the CLOSEST enemy or crate that can jump arcs
+                score += (50.0 - dist) * 10.0
+            else:
+                score += len(secondaries) * 100.0
+                score += (50.0 - dist)
+                if not is_crate:
+                    score += 50.0  # Slightly prefer mech/NPC over lone crate if no shield jump
+
+            dx = cpos[0] - my_pos[0]
+            dy = cpos[1] - my_pos[1]
+            c_z = cpos[2] if len(cpos) > 2 else 0.0
+            dz = (c_z + 1.2 if is_crate else c_z + 4.5) - (my_pos[2] + 7.0)
+            horiz = max(dist, 0.01)
+            aim_y = math.atan2(dy, dx)
+            aim_p = math.atan2(dz, horiz)
+
+            res = LightningChainResult(
+                primary_target=cand,
+                primary_pos=(cpos[0], cpos[1], c_z),
+                primary_damage=self.base_damage,
+                secondary_targets=secondaries,
+                secondary_damages=sec_damages,
+                total_damage=total_dmg,
+                jumps_to_shielded=jumps_to_shield,
+                aim_yaw=aim_y,
+                aim_pitch=aim_p,
+                is_crate_primary=is_crate,
+                score=score
+            )
+            results.append(res)
+
+        if not results:
+            return None
+
+        results.sort(key=lambda r: r.score, reverse=True)
+        return results[0]
 
 
 class NPCHunter:
@@ -1304,6 +1606,7 @@ class ArtillerySystem:
         self.npc_hunter = NPCHunter()
         self.target_scorer = DynamicTargetScorer()
         self.combo = LaserLightningCombo()
+        self.chain_farming = self.lightning.chain_farming
 
         # Telemetry / execution stats
         self.total_evals = 0
@@ -1329,6 +1632,28 @@ class ArtillerySystem:
         """Solves exact first-order predictive lead: |P + V*t - M|^2 = (s*t)^2."""
         return compute_exact_predictive_lead(my_pos, target_pos, target_vel, bullet_speed)
 
+    def solve_ground_bounce_splash(
+        self,
+        my_pos: Union[List[float], Tuple[float, float, float]],
+        target_pos: Union[List[float], Tuple[float, float, float]],
+        target_vel: Optional[Union[List[float], Tuple[float, float, float]]] = None,
+        behind_offset: float = MORTAR_GROUND_BOUNCE_OFFSET_DEFAULT,
+        terrain_z: Optional[float] = None
+    ) -> Optional[MortarTrajectory]:
+        """Mortar Splash Ground-Bouncing Solver: hits terrain immediately behind ducking target."""
+        return self.mortar.solve_ground_bounce_splash(my_pos, target_pos, target_vel, behind_offset, terrain_z)
+
+    def evaluate_lightning_chain(
+        self,
+        my_pos: Union[List[float], Tuple[float, ...]],
+        aim_yaw: float,
+        enemies: List[Dict[str, Any]],
+        crates: Optional[List[Dict[str, Any]]] = None,
+        npcs: Optional[List[Dict[str, Any]]] = None
+    ) -> Optional[LightningChainResult]:
+        """Lightning Chain Farming evaluator: chains to 2 secondary targets within 14m (0.7x damage)."""
+        return self.chain_farming.evaluate_chain_farming(my_pos, aim_yaw, enemies, crates, npcs)
+
     def evaluate_combat_tick(
         self,
         me: Dict[str, Any],
@@ -1338,7 +1663,9 @@ class ArtillerySystem:
         drops: Optional[List[Dict[str, Any]]] = None,
         all_enemies: Optional[List[Dict[str, Any]]] = None,
         in_cover: bool = False,
-        current_time: float = 0.0
+        current_time: float = 0.0,
+        crates: Optional[List[Dict[str, Any]]] = None,
+        ducking_behind_wall: bool = False
     ) -> Dict[str, Any]:
         """
         Executes unified combat and artillery evaluation for the current tick.
@@ -1431,16 +1758,37 @@ class ArtillerySystem:
 
                 # --- Weapon: Lightning ---
                 elif w_kind == "lightning":
-                    # LaserLightningCombo: discharge within 40m cone to apply short_s: 2.0 (locks enemy laser offline)
-                    if self.combo.should_discharge_lightning(my_pos, aim[0], target, energy, w_cd) or \
-                       self.lightning.should_fire(my_pos, aim[0], t_pos, energy, w_cd):
+                    # Lightning Chain Farming: evaluate group fight chains (enemies + crates)
+                    chain_res = None
+                    enemy_pool = all_enemies if all_enemies else ([target] if target else [])
+                    if crates or (len(enemy_pool) > 1) or any(self.chain_farming.is_shielded(e) for e in enemy_pool):
+                        chain_res = self.chain_farming.evaluate_chain_farming(
+                            my_pos, aim[0], enemy_pool, crates or []
+                        )
+
+                    if chain_res and (chain_res.jumps_to_shielded or len(chain_res.secondary_targets) > 0) and w_cd <= 0.05 and energy >= 3.0:
+                        result_fire[slot_idx] = True
+                        result_aim = [chain_res.aim_yaw, chain_res.aim_pitch]
+                        tactical_move = "LIGHTNING_CHAIN_FARMING"
+                    elif self.combo.should_discharge_lightning(my_pos, aim[0], target, energy, w_cd) or \
+                         self.lightning.should_fire(my_pos, aim[0], t_pos, energy, w_cd):
                         result_fire[slot_idx] = True
                         tactical_move = "LIGHTNING_ENGAGE"
 
                 # --- Weapon: Mortar ---
                 elif w_kind == "mortar":
-                    # If target is behind cover (no LOS) or stationary
-                    if (not has_los or t_dist > 60.0) and w_cd <= 0.05:
+                    # 1. Mortar Splash Ground-Bouncing: When target ducks behind low wall,
+                    # hit terrain immediately behind them within the 7m splash zone.
+                    if ducking_behind_wall and w_cd <= 0.05:
+                        bounce_traj = self.mortar.solve_ground_bounce_splash(
+                            my_pos, t_pos, target.get("vel"), behind_offset=MORTAR_GROUND_BOUNCE_OFFSET_DEFAULT
+                        )
+                        if bounce_traj and self.mortar.can_clear_obstacles(my_pos, bounce_traj.predicted_impact, bounce_traj.pitch):
+                            result_fire[slot_idx] = True
+                            result_aim = [bounce_traj.yaw, bounce_traj.pitch]
+                            tactical_move = "MORTAR_GROUND_BOUNCE_SPLASH"
+                    # 2. Standard high-arc lob over buildings when no direct LOS or long distance
+                    elif (not has_los or t_dist > 60.0) and w_cd <= 0.05:
                         traj = self.mortar.solve_high_arc(my_pos, t_pos, target.get("vel"))
                         if traj and self.mortar.can_clear_obstacles(my_pos, t_pos, traj.pitch):
                             result_fire[slot_idx] = True
@@ -1565,6 +1913,54 @@ if __name__ == "__main__":
     assert LIGHTNING_SHORT_S == 2.0
     print(f"[PASS] Lightning short_s: 2.0s locks enemy Lasers offline for 2s.")
 
+    # 7. Mortar Splash Ground-Bouncing Test
+    # When a target ducks behind a low wall, solve the mortar parabolic trajectory
+    # to hit the terrain immediately behind them within the 7m splash zone.
+    mortar_solver = IndirectParabolicMortarSolver()
+    ducking_target_pos = [75.0, 0.0, 0.0]
+    ground_bounce_traj = mortar_solver.solve_ground_bounce_splash(
+        my_pos=[0.0, 0.0, 0.0],
+        target_pos=ducking_target_pos,
+        behind_offset=3.5
+    )
+    assert ground_bounce_traj is not None, "Failed to solve ground-bouncing mortar trajectory!"
+    pred_impact = ground_bounce_traj.predicted_impact
+    impact_dist_to_target = math.hypot(pred_impact[0] - ducking_target_pos[0], pred_impact[1] - ducking_target_pos[1])
+    assert impact_dist_to_target <= MORTAR_SPLASH_RADIUS, f"Impact {impact_dist_to_target}m exceeds 7m splash zone!"
+    assert abs(impact_dist_to_target - 3.5) < 1e-4, f"Impact offset mismatch: {impact_dist_to_target}"
+    assert ground_bounce_traj.is_high_arc is True, "Ground-bounce trajectory must be high-arc to clear the low wall!"
+    splash_dmg = mortar_solver.calculate_splash_damage(impact_dist_to_target)
+    assert splash_dmg == 104.0, f"Expected 104.0 splash damage at 3.5m, got {splash_dmg}"
+    print(f"[PASS] Mortar Splash Ground-Bouncing: Apex={ground_bounce_traj.apex_height:.1f}m, impact={pred_impact[0]:.1f}m ({impact_dist_to_target:.1f}m behind target <= {MORTAR_SPLASH_RADIUS}m splash zone, {splash_dmg:.1f} splash dmg + 16m/s concussion).")
+
+    # 8. Lightning Chain Farming Test
+    # Lightning chains to 2 secondary targets within 14m (0.7x damage = 42.0 dmg each).
+    # In group fights: target the closest enemy or crate to jump arcs into shielded targets.
+    chain_engine = LightningChainFarming()
+    group_enemies = [
+        {"id": 2, "kind": "mech", "hp": 900.0, "shield": True, "pos": [32.0, 4.0, 0.0]},     # Shielded target!
+        {"id": 3, "kind": "mech", "hp": 400.0, "shield": False, "pos": [26.0, -5.0, 0.0]},   # Unshielded enemy
+    ]
+    group_crates = [
+        {"id": 1005, "kind": "crate", "hp": 300.0, "pos": [22.0, 1.0, 0.0]}                   # Close crate at 22m!
+    ]
+    # The crate at [22, 1] is within 14m of shielded enemy [32, 4] (dist = 10.44m <= 14m)!
+    # And within 14m of unshielded enemy [26, -5] (dist = 7.21m <= 14m)!
+    chain_result = chain_engine.evaluate_chain_farming(
+        my_pos=[0.0, 0.0, 0.0],
+        aim_yaw=0.0,
+        enemies=group_enemies,
+        crates=group_crates
+    )
+    assert chain_result is not None, "Failed to evaluate lightning chain farming!"
+    # Verify: targets the closest crate (22m) to jump arcs into the shielded enemy!
+    assert chain_result.primary_target["id"] == 1005, f"Expected crate 1005 as primary proxy, got {chain_result.primary_target['id']}"
+    assert chain_result.jumps_to_shielded is True, "Must detect arc jumping into shielded target!"
+    assert len(chain_result.secondary_targets) == 2, f"Expected 2 secondary targets, got {len(chain_result.secondary_targets)}"
+    assert chain_result.secondary_damages == [42.0, 42.0], f"Expected 0.7x damage (42.0), got {chain_result.secondary_damages}"
+    assert chain_result.total_damage == 144.0, f"Expected 60 + 42 + 42 = 144.0 damage, got {chain_result.total_damage}"
+    print(f"[PASS] Lightning Chain Farming: Targeted closest crate {chain_result.primary_target['id']} at 22m -> jumped arcs into shielded Enemy 2 (42 dmg) + Enemy 3 (42 dmg). Total damage = {chain_result.total_damage:.1f} (0.7x chain mult).")
+
     print("\n==================================================================")
-    print("[BALLIS] All Phase 2 Ballistics Lead & Rear-Armor Calibrations Passed with 0 Errors!")
+    print("[BALLIS] All Weapons, Lead Math, Ground-Bouncing & Chain Farming Calibrations Passed with 0 Errors!")
     print("==================================================================")
